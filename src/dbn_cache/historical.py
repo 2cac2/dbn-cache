@@ -37,7 +37,7 @@ from .exceptions import MissingAPIKeyError
 from .models import CachedData
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from pathlib import Path
 
     import pandas as pd
@@ -221,9 +221,9 @@ class CacheStore:
 class _CachedTimeseries:
     """Cached mirror of ``databento.Historical.timeseries``."""
 
-    def __init__(self, cache: DataCache, real: Any) -> None:
+    def __init__(self, cache: DataCache, real_getter: Callable[[], Any]) -> None:
         self._cache = cache
-        self._real = real
+        self._get_real = real_getter
 
     def get_range(
         self,
@@ -241,7 +241,7 @@ class _CachedTimeseries:
         symbol_list = _normalize_symbols(symbols)
         if symbol_list is None:
             # Uncacheable (ALL_SYMBOLS / instrument ids / None): pass through.
-            return self._real.timeseries.get_range(
+            return self._get_real().timeseries.get_range(
                 dataset=dataset,
                 start=start,
                 end=end,
@@ -349,7 +349,7 @@ class Historical:
             storage=storage,
             url=url,
         )
-        self.timeseries = _CachedTimeseries(self._cache, self._real)
+        self.timeseries = _CachedTimeseries(self._cache, lambda: self._real)
 
     @property
     def cache(self) -> DataCache:
