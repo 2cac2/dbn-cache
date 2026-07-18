@@ -1,16 +1,13 @@
-import json
 import logging
 import os
-import shutil
 import tempfile
 import warnings
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
-from filelock import FileLock
 
 from .calendar import iter_trading_days
 from .client import DatabentoClient
@@ -35,23 +32,24 @@ from .models import (
     SymbolMeta,
     UpdateAllResult,
 )
+from .storage.base import PartitionKey, StorageBackend
+from .storage.factory import create_backend
+from .storage.filesystem import FilesystemBackend
 from .utils import (
     detect_stype,
     find_missing_date_ranges,
     get_default_cache_dir,
-    get_partition_path,
     has_lookahead_bias,
     is_tick_schema,
     iter_days,
     iter_months,
     merge_date_ranges,
     month_start_end,
-    normalize_symbol,
     utc_today,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -89,57 +87,6 @@ def _parse_quality_warnings(
     return sorted(issues, key=lambda i: i.date)
 
 
-def _get_actual_date_range(parquet_path: Path) -> tuple[date, date] | None:
-    """Get the actual date range from timestamps in a parquet file.
-
-    Returns:
-        Tuple of (start_date, end_date) based on actual data, or None if empty.
-    """
-    df = pl.scan_parquet(parquet_path)
-    schema = df.collect_schema()
-
-    # Find timestamp column (ts_event for databento, ts for tests)
-    ts_col: str | None = None
-    for col in ["ts_event", "ts"]:
-        if col in schema:
-            ts_col = col
-            break
-
-    if ts_col is None:
-        return None
-
-    col_type = schema[ts_col]
-    is_datetime = col_type == pl.Datetime or str(col_type).startswith("Datetime")
-    is_int = col_type == pl.Int64 or col_type == pl.UInt64
-
-    if not is_datetime and not is_int:
-        return None
-
-    result = df.select(
-        pl.col(ts_col).min().alias("min_ts"),
-        pl.col(ts_col).max().alias("max_ts"),
-    ).collect()
-
-    if result.is_empty():
-        return None
-
-    min_ts = result["min_ts"][0]
-    max_ts = result["max_ts"][0]
-
-    if min_ts is None or max_ts is None:
-        return None
-
-    if is_datetime:
-        start_date = min_ts.date()
-        end_date = max_ts.date()
-    else:
-        # Int64/UInt64: nanoseconds since UNIX epoch (Databento format)
-        start_date = datetime.fromtimestamp(min_ts / 1e9, tz=UTC).date()
-        end_date = datetime.fromtimestamp(max_ts / 1e9, tz=UTC).date()
-
-    return start_date, end_date
-
-
 class DataCache:
     """Cache for Databento historical market data."""
 
@@ -147,24 +94,51 @@ class DataCache:
         self,
         cache_dir: Path | None = None,
         client: DatabentoClient | None = None,
+        *,
+        storage: StorageBackend | None = None,
+        url: str | None = None,
     ) -> None:
         """Initialize cache.
 
         Args:
-            cache_dir: Cache directory. Defaults to ~/.databento or DATABENTO_CACHE_DIR.
+            cache_dir: Cache directory for the filesystem backend. Defaults to
+                ~/.databento or DATABENTO_CACHE_DIR. Also used for sidecar lock
+                files when a SQL backend is selected.
             client: DatabentoClient instance. Created on demand if not provided.
+            storage: An explicit StorageBackend. Takes precedence over url.
+            url: A SQLAlchemy connection URL (e.g. 'sqlite:///cache.db',
+                'postgresql://user:pw@host/db') selecting a SQL backend. If not
+                given, the DBN_CACHE_URL / DATABENTO_CACHE_URL env vars are used.
         """
-        if cache_dir is None:
-            env_dir = os.environ.get("DATABENTO_CACHE_DIR")
-            cache_dir = Path(env_dir) if env_dir else get_default_cache_dir()
-        self._cache_dir = cache_dir
+        if storage is not None:
+            self._backend: StorageBackend = storage
+        else:
+            resolved_url = (
+                url
+                or os.environ.get("DBN_CACHE_URL")
+                or os.environ.get("DATABENTO_CACHE_URL")
+            )
+            if resolved_url:
+                self._backend = create_backend(resolved_url, cache_dir)
+            else:
+                if cache_dir is None:
+                    env_dir = os.environ.get("DATABENTO_CACHE_DIR")
+                    cache_dir = Path(env_dir) if env_dir else get_default_cache_dir()
+                self._backend = FilesystemBackend(cache_dir)
+
+        self._cache_dir = self._backend.cache_dir
         self._client = client
         self._available_end_cache: dict[str, date] = {}
 
     @property
     def cache_dir(self) -> Path:
-        """Get cache directory."""
+        """Get cache directory (filesystem location associated with the backend)."""
         return self._cache_dir
+
+    @property
+    def backend(self) -> StorageBackend:
+        """Get the storage backend."""
+        return self._backend
 
     def _get_client(self) -> DatabentoClient:
         """Get or create client."""
@@ -195,82 +169,28 @@ class DataCache:
             )
             return None
 
-    def _get_symbol_path(self, dataset: str, symbol: str, schema: str) -> Path:
-        """Get path to symbol/schema cache directory."""
-        return self._cache_dir / dataset / normalize_symbol(symbol) / schema
-
-    def _get_meta_path(self, dataset: str, symbol: str, schema: str) -> Path:
-        """Get path to metadata file."""
-        return self._get_symbol_path(dataset, symbol, schema) / "meta.json"
-
-    def _get_lock_path(self, dataset: str, symbol: str, schema: str) -> Path:
-        """Get path to lock file."""
-        return self._get_symbol_path(dataset, symbol, schema) / ".lock"
-
-    def _cleanup_empty_dirs(self, start_path: Path, stop_at: Path) -> None:
-        """Remove empty directories walking up from start_path to stop_at."""
-        current = start_path
-        while current >= stop_at:
-            try:
-                if current.is_dir() and not any(current.iterdir()):
-                    current.rmdir()
-                else:
-                    break
-            except OSError:
-                break
-            current = current.parent
-
-    @contextmanager
     def _lock(
         self, dataset: str, symbol: str, schema: str, timeout: float = 300
-    ) -> "Iterator[None]":
-        """Acquire file lock for symbol/schema."""
-        lock_path = self._get_lock_path(dataset, symbol, schema)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(lock_path, timeout=timeout)
-        with lock:
-            yield
-
-    def _load_meta(self, dataset: str, symbol: str, schema: str) -> SymbolMeta | None:
-        """Load metadata from cache."""
-        meta_path = self._get_meta_path(dataset, symbol, schema)
-        if not meta_path.exists():
-            return None
-        with meta_path.open() as f:
-            data = json.load(f)
-        return SymbolMeta.model_validate(data)
+    ) -> AbstractContextManager[None]:
+        """Acquire the backend lock for a symbol/schema."""
+        return self._backend.lock(dataset, symbol, schema, timeout)
 
     def _validate_and_fix_meta(self, meta: SymbolMeta) -> SymbolMeta | None:
-        """Validate metadata against actual parquet files and fix if needed.
+        """Validate metadata against actual stored data and fix if needed.
 
         Returns:
             Updated SymbolMeta if fixes were needed, None if metadata is correct.
         """
-        base_path = self._get_symbol_path(meta.dataset, meta.symbol, meta.schema_)
-        parquet_files = list(base_path.glob("**/*.parquet"))
-
-        if not parquet_files:
+        actual = self._backend.actual_data_range(
+            meta.dataset, meta.symbol, meta.schema_
+        )
+        if actual is None:
             return None
-
-        # Get actual date range from all parquet files
-        all_min: date | None = None
-        all_max: date | None = None
-
-        for pf in parquet_files:
-            actual_range = _get_actual_date_range(pf)
-            if actual_range:
-                file_min, file_max = actual_range
-                if all_min is None or file_min < all_min:
-                    all_min = file_min
-                if all_max is None or file_max > all_max:
-                    all_max = file_max
-
-        if all_min is None or all_max is None:
-            return None
+        all_min, all_max = actual
 
         # Check if metadata matches actual data
         if not meta.ranges:
-            # Metadata has no ranges but files exist — needs fix
+            # Metadata has no ranges but data exists — needs fix
             return SymbolMeta(
                 dataset=meta.dataset,
                 symbol=meta.symbol,
@@ -303,44 +223,20 @@ class DataCache:
             quality_issues=meta.quality_issues,
         )
 
-    def _save_meta(self, meta: SymbolMeta) -> None:
-        """Save metadata to cache."""
-        meta_path = self._get_meta_path(meta.dataset, meta.symbol, meta.schema_)
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        with meta_path.open("w") as f:
-            json.dump(meta.model_dump(by_alias=True), f, indent=2, default=str)
-
     def _rebuild_meta_from_files(
         self, dataset: str, symbol: str, schema: str
     ) -> SymbolMeta | None:
-        """Rebuild metadata from existing parquet files.
+        """Rebuild metadata from existing stored data.
 
-        Used when meta.json is missing but parquet files exist.
+        Used when metadata is missing but partition data exists.
 
         Returns:
-            New SymbolMeta if files found, None if no files.
+            New SymbolMeta if data found, None if no data.
         """
-        base_path = self._get_symbol_path(dataset, symbol, schema)
-        parquet_files = list(base_path.glob("**/*.parquet"))
-
-        if not parquet_files:
+        actual = self._backend.actual_data_range(dataset, symbol, schema)
+        if actual is None:
             return None
-
-        # Get actual date range from all parquet files
-        all_min: date | None = None
-        all_max: date | None = None
-
-        for pf in parquet_files:
-            actual_range = _get_actual_date_range(pf)
-            if actual_range:
-                file_min, file_max = actual_range
-                if all_min is None or file_min < all_min:
-                    all_min = file_min
-                if all_max is None or file_max > all_max:
-                    all_max = file_max
-
-        if all_min is None or all_max is None:
-            return None
+        all_min, all_max = actual
 
         # Denormalize symbol (ES_c_0 -> ES.c.0)
         original_symbol = symbol.replace("_", ".")
@@ -376,12 +272,9 @@ class DataCache:
         end: date,
         dataset: str,
         dest_path: Path,
+        stype: str | None = None,
     ) -> None:
-        """Download data for a partition and save to dest_path."""
-        from datetime import timedelta
-
-        import polars as pl
-
+        """Download data for a partition and save to dest_path (a temp file)."""
         client = self._get_client()
         # Databento API end date is exclusive, so add 1 day
         api_end = end + timedelta(days=1)
@@ -391,30 +284,11 @@ class DataCache:
             start=start,
             end=api_end,
             dataset=dataset,
+            stype=stype,
         )
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         df = pl.from_pandas(data.to_df().reset_index())
         df.write_parquet(dest_path)
-
-    def _get_cached_files(
-        self, dataset: str, symbol: str, schema: str, start: date, end: date
-    ) -> list[Path]:
-        """Get list of cached parquet files for date range."""
-        base_path = self._get_symbol_path(dataset, symbol, schema)
-        files: list[Path] = []
-
-        if is_tick_schema(schema):
-            for d in iter_days(start, end):
-                path = get_partition_path(base_path, schema, d.year, d.month, d.day)
-                if path.exists():
-                    files.append(path)
-        else:
-            for year, month in iter_months(start, end):
-                path = get_partition_path(base_path, schema, year, month)
-                if path.exists():
-                    files.append(path)
-
-        return files
 
     def _count_partitions_in_range(
         self,
@@ -451,23 +325,22 @@ class DataCache:
         start: date,
         end: date,
     ) -> list[DateRange]:
-        """Find partitions that are missing actual files on disk.
+        """Find partitions that are missing from storage.
 
         For tick schemas, only considers trading days (skips holidays/weekends).
-        Returns date ranges for partitions where files don't exist.
+        Returns date ranges for partitions that have not been stored.
         """
-        base_path = self._get_symbol_path(dataset, symbol, schema)
         missing: list[DateRange] = []
 
         if is_tick_schema(schema):
             for d in iter_trading_days(start, end, dataset):
-                path = get_partition_path(base_path, schema, d.year, d.month, d.day)
-                if not path.exists():
+                key = PartitionKey(dataset, symbol, schema, d.year, d.month, d.day)
+                if not self._backend.partition_exists(key):
                     missing.append(DateRange(start=d, end=d))
         else:
             for year, month in iter_months(start, end):
-                path = get_partition_path(base_path, schema, year, month)
-                if not path.exists():
+                key = PartitionKey(dataset, symbol, schema, year, month)
+                if not self._backend.partition_exists(key):
                     m_start, m_end = month_start_end(year, month)
                     clamped_start = max(m_start, start)
                     clamped_end = min(m_end, end)
@@ -492,12 +365,12 @@ class DataCache:
             start: Start date (inclusive)
             end: End date (inclusive)
             dataset: Databento dataset
-            verify_files: If True, verify actual files exist (not just metadata)
+            verify_files: If True, verify actual partitions exist (not just metadata)
 
         Returns:
             CacheCheckResult with status and details about cached/missing data.
         """
-        meta = self._load_meta(dataset, symbol, schema)
+        meta = self._backend.load_meta(dataset, symbol, schema)
         cached_ranges = list(meta.ranges) if meta else []
         missing_from_meta = self._find_missing_ranges(start, end, cached_ranges)
 
@@ -554,26 +427,23 @@ class DataCache:
             dataset: Databento dataset
 
         Returns:
-            Number of partition files deleted.
+            Number of partitions deleted.
         """
-        base_path = self._get_symbol_path(dataset, symbol, schema)
         deleted = 0
 
         with self._lock(dataset, symbol, schema):
             if is_tick_schema(schema):
                 for d in iter_days(start, end):
-                    path = get_partition_path(base_path, schema, d.year, d.month, d.day)
-                    if path.exists():
-                        path.unlink()
+                    key = PartitionKey(dataset, symbol, schema, d.year, d.month, d.day)
+                    if self._backend.delete_partition(key):
                         deleted += 1
             else:
                 for year, month in iter_months(start, end):
-                    path = get_partition_path(base_path, schema, year, month)
-                    if path.exists():
-                        path.unlink()
+                    key = PartitionKey(dataset, symbol, schema, year, month)
+                    if self._backend.delete_partition(key):
                         deleted += 1
 
-            meta = self._load_meta(dataset, symbol, schema)
+            meta = self._backend.load_meta(dataset, symbol, schema)
             if meta:
                 remaining_ranges: list[DateRange] = []
                 for r in meta.ranges:
@@ -597,11 +467,9 @@ class DataCache:
 
                 if remaining_ranges:
                     meta.ranges = self._merge_ranges(remaining_ranges)
-                    self._save_meta(meta)
+                    self._backend.save_meta(meta)
                 else:
-                    meta_path = self._get_meta_path(dataset, symbol, schema)
-                    if meta_path.exists():
-                        meta_path.unlink()
+                    self._backend.delete_meta(dataset, symbol, schema)
 
         return deleted
 
@@ -609,37 +477,28 @@ class DataCache:
         self,
         schema: str,
         missing: list[DateRange],
-        base_path: Path,
+        dataset: str,
+        symbol: str,
         request_start: date,
         request_end: date,
         cached_ranges: list[DateRange],
-        dataset: str,
-    ) -> tuple[int, list[tuple[PartitionInfo, Path, date, date]]]:
+    ) -> tuple[int, list[tuple[PartitionInfo, date, date]]]:
         """Count partitions that need downloading and build download list.
 
         For tick schemas, only includes trading days (skips holidays/weekends).
 
-        Args:
-            schema: Data schema
-            missing: List of missing date ranges
-            base_path: Base path for partition files
-            request_start: Original request start date
-            request_end: Original request end date
-            cached_ranges: Existing cached date ranges
-            dataset: Databento dataset (required for calendar lookup)
-
         Returns:
-            Tuple of (total count, list of partition download info).
+            Tuple of (total count, list of (partition info, dl_start, dl_end)).
         """
-        partitions: list[tuple[PartitionInfo, Path, date, date]] = []
+        partitions: list[tuple[PartitionInfo, date, date]] = []
 
         for gap in missing:
             if is_tick_schema(schema):
                 for d in iter_trading_days(gap.start, gap.end, dataset):
-                    dest = get_partition_path(base_path, schema, d.year, d.month, d.day)
-                    if not dest.exists():
+                    key = PartitionKey(dataset, symbol, schema, d.year, d.month, d.day)
+                    if not self._backend.partition_exists(key):
                         info = PartitionInfo(year=d.year, month=d.month, day=d.day)
-                        partitions.append((info, dest, d, d))
+                        partitions.append((info, d, d))
             else:
                 # Track seen partitions to avoid duplicates when gaps span months
                 seen: set[tuple[int, int]] = set()
@@ -648,7 +507,6 @@ class DataCache:
                         continue
                     seen.add((year, month))
 
-                    dest = get_partition_path(base_path, schema, year, month)
                     m_start, m_end = month_start_end(year, month)
                     # Start with request range clamped to month
                     dl_start = max(m_start, request_start)
@@ -663,8 +521,8 @@ class DataCache:
 
                     info = PartitionInfo(year=year, month=month)
                     # Always include - if there's a gap in this month, we need to
-                    # re-download the partition even if the file exists
-                    partitions.append((info, dest, dl_start, dl_end))
+                    # re-download the partition even if it exists
+                    partitions.append((info, dl_start, dl_end))
 
         return len(partitions), partitions
 
@@ -684,7 +542,7 @@ class DataCache:
             ranges=self._merge_ranges(cached_ranges),
             updated_at=datetime.now(UTC),
         )
-        self._save_meta(new_meta)
+        self._backend.save_meta(new_meta)
 
     def download(
         self,
@@ -696,6 +554,7 @@ class DataCache:
         on_progress: "Callable[[DownloadProgress], None] | None" = None,
         cancelled: "Callable[[], bool] | None" = None,
         rollover_days: int = 14,
+        stype: str | None = None,
     ) -> CachedData:
         """Download data and cache it.
 
@@ -711,9 +570,11 @@ class DataCache:
             cancelled: Optional callable that returns True if download should stop
             rollover_days: Days before front-month to start (for auto-detected dates).
                 Default 14.
+            stype: Symbol type (stype_in) to pass to the API. Auto-detected from the
+                symbol format if not provided.
 
         Returns:
-            CachedData wrapper for the downloaded files.
+            CachedData wrapper for the downloaded data.
 
         Raises:
             DownloadCancelledError: If download was cancelled via the cancelled callback
@@ -772,10 +633,8 @@ class DataCache:
                 symbol,
             )
 
-        base_path = self._get_symbol_path(dataset, symbol, schema)
-
         with self._lock(dataset, symbol, schema):
-            meta = self._load_meta(dataset, symbol, schema)
+            meta = self._backend.load_meta(dataset, symbol, schema)
             cached_ranges = list(meta.ranges) if meta else []
             missing_from_meta = self._find_missing_ranges(start, end, cached_ranges)
 
@@ -786,16 +645,16 @@ class DataCache:
             missing = self._merge_ranges(all_missing) if all_missing else []
 
             if not missing:
-                files = self._get_cached_files(dataset, symbol, schema, start, end)
-                return CachedData(files, start=start, end=end)
+                reader = self._backend.read_range(dataset, symbol, schema, start, end)
+                return CachedData(reader, start=start, end=end)
 
             total, partitions = self._count_partitions_to_download(
-                schema, missing, base_path, start, end, cached_ranges, dataset
+                schema, missing, dataset, symbol, start, end, cached_ranges
             )
 
             if total == 0:
-                files = self._get_cached_files(dataset, symbol, schema, start, end)
-                return CachedData(files, start=start, end=end)
+                reader = self._backend.read_range(dataset, symbol, schema, start, end)
+                return CachedData(reader, start=start, end=end)
 
             completed_ranges: list[DateRange] = list(cached_ranges)
 
@@ -811,7 +670,7 @@ class DataCache:
                     )
 
                 try:
-                    for current, (partition_info, dest, dl_start, dl_end) in enumerate(
+                    for current, (partition_info, dl_start, dl_end) in enumerate(
                         partitions, start=1
                     ):
                         if on_progress:
@@ -830,10 +689,26 @@ class DataCache:
                         ) as tmp:
                             tmp_path = Path(tmp.name)
                         try:
-                            self._download_partition(
-                                api_symbol, schema, dl_start, dl_end, dataset, tmp_path
-                            )
-                            # Check if downloaded data has any rows before creating dirs
+                            if stype:
+                                self._download_partition(
+                                    api_symbol,
+                                    schema,
+                                    dl_start,
+                                    dl_end,
+                                    dataset,
+                                    tmp_path,
+                                    stype=stype,
+                                )
+                            else:
+                                self._download_partition(
+                                    api_symbol,
+                                    schema,
+                                    dl_start,
+                                    dl_end,
+                                    dataset,
+                                    tmp_path,
+                                )
+                            # Check the downloaded data has rows before committing
                             row_count = (
                                 pl.scan_parquet(tmp_path)
                                 .select(pl.len())
@@ -844,8 +719,16 @@ class DataCache:
                                 # No data for this partition, skip it
                                 tmp_path.unlink(missing_ok=True)
                                 continue
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(tmp_path, dest)
+                            key = PartitionKey(
+                                dataset,
+                                symbol,
+                                schema,
+                                partition_info.year,
+                                partition_info.month,
+                                partition_info.day,
+                            )
+                            self._backend.commit_partition(key, tmp_path)
+                            tmp_path.unlink(missing_ok=True)
                         except BaseException:
                             tmp_path.unlink(missing_ok=True)
                             raise
@@ -879,22 +762,16 @@ class DataCache:
                             symbol, schema, issues, dataset
                         )
 
-        files = self._get_cached_files(dataset, symbol, schema, start, end)
+        reader = self._backend.read_range(dataset, symbol, schema, start, end)
 
-        # Check if downloaded files have actual data (not just empty parquet schema)
-        total_rows = sum(
-            pl.scan_parquet(f).select(pl.len()).collect().item() for f in files
-        )
+        # Check downloaded data has actual rows (not just empty parquet schema)
+        total_rows = reader.scan().select(pl.len()).collect().item()
         if total_rows == 0:
-            # Clean up lock file and empty directories
-            lock_path = self._get_lock_path(dataset, symbol, schema)
-            lock_path.unlink(missing_ok=True)
-            symbol_path = self._get_symbol_path(dataset, symbol, schema)
-            dataset_path = self.cache_dir / dataset
-            self._cleanup_empty_dirs(symbol_path, dataset_path)
+            # Clean up lock file and empty artifacts
+            self._backend.cleanup(dataset, symbol, schema)
             raise EmptyDataError(symbol, dataset)
 
-        return CachedData(files, start=start, end=end)
+        return CachedData(reader, start=start, end=end)
 
     def get(
         self,
@@ -917,7 +794,7 @@ class DataCache:
             CachedData wrapper.
 
         Raises:
-            CacheMissError: If data is not fully cached or files are missing.
+            CacheMissError: If data is not fully cached or partitions are missing.
         """
         check = self.check_cache(symbol, schema, start, end, dataset, verify_files=True)
         if check.status != CacheStatus.COMPLETE:
@@ -927,8 +804,8 @@ class DataCache:
                 msg = f"Missing data for {symbol}/{schema}: {check.missing_ranges}"
             raise CacheMissError(msg)
 
-        files = self._get_cached_files(dataset, symbol, schema, start, end)
-        return CachedData(files, start=start, end=end)
+        reader = self._backend.read_range(dataset, symbol, schema, start, end)
+        return CachedData(reader, start=start, end=end)
 
     def ensure(
         self,
@@ -1093,7 +970,7 @@ class DataCache:
                     cancelled=cancelled,
                 )
                 updated.append(item)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 errors.append((item, e))
 
         return UpdateAllResult(
@@ -1113,40 +990,20 @@ class DataCache:
         """
         results: list[CachedDataInfo] = []
 
-        if dataset:
-            datasets = [dataset]
-        else:
-            if not self._cache_dir.exists():
-                return []
-            datasets = [d.name for d in self._cache_dir.iterdir() if d.is_dir()]
-
-        for ds in datasets:
-            ds_path = self._cache_dir / ds
-            if not ds_path.exists():
-                continue
-            for symbol_dir in ds_path.iterdir():
-                if not symbol_dir.is_dir():
-                    continue
-                for schema_dir in symbol_dir.iterdir():
-                    if not schema_dir.is_dir():
-                        continue
-                    meta = self._load_meta(ds, symbol_dir.name, schema_dir.name)
-                    if meta:
-                        size = sum(
-                            f.stat().st_size
-                            for f in schema_dir.rglob("*.parquet")
-                            if f.is_file()
-                        )
-                        results.append(
-                            CachedDataInfo(
-                                dataset=ds,
-                                symbol=meta.symbol,
-                                schema=meta.schema_,
-                                ranges=meta.ranges,
-                                size_bytes=size,
-                                quality_issues=meta.quality_issues,
-                            )
-                        )
+        for ds, symbol_key, schema in self._backend.list_keys(dataset):
+            meta = self._backend.load_meta(ds, symbol_key, schema)
+            if meta:
+                size = self._backend.size_bytes(ds, symbol_key, schema)
+                results.append(
+                    CachedDataInfo(
+                        dataset=ds,
+                        symbol=meta.symbol,
+                        schema=meta.schema_,
+                        ranges=meta.ranges,
+                        size_bytes=size,
+                        quality_issues=meta.quality_issues,
+                    )
+                )
 
         return results
 
@@ -1158,14 +1015,11 @@ class DataCache:
         Returns:
             CachedDataInfo or None if not cached.
         """
-        meta = self._load_meta(dataset, symbol, schema)
+        meta = self._backend.load_meta(dataset, symbol, schema)
         if meta is None:
             return None
 
-        base_path = self._get_symbol_path(dataset, symbol, schema)
-        size = sum(
-            f.stat().st_size for f in base_path.rglob("*.parquet") if f.is_file()
-        )
+        size = self._backend.size_bytes(dataset, symbol, schema)
 
         return CachedDataInfo(
             dataset=dataset,
@@ -1179,11 +1033,11 @@ class DataCache:
     def validate_metadata(
         self, dataset: str | None = None, *, fix: bool = False
     ) -> list[tuple[str, str, str, str]]:
-        """Validate metadata date ranges against actual parquet data.
+        """Validate metadata date ranges against actual stored data.
 
-        Checks that metadata start/end dates match the actual data in parquet
-        files. Mismatches can occur when partition boundaries (month-end dates)
-        are stored in metadata but the actual data ends earlier (e.g., expired
+        Checks that metadata start/end dates match the actual data in storage.
+        Mismatches can occur when partition boundaries (month-end dates) are
+        stored in metadata but the actual data ends earlier (e.g., expired
         futures contracts).
 
         Args:
@@ -1195,48 +1049,31 @@ class DataCache:
         """
         results: list[tuple[str, str, str, str]] = []
 
-        if dataset:
-            datasets = [dataset]
-        else:
-            if not self._cache_dir.exists():
-                return []
-            datasets = [d.name for d in self._cache_dir.iterdir() if d.is_dir()]
-
-        for ds in datasets:
-            ds_path = self._cache_dir / ds
-            if not ds_path.exists():
+        for ds, symbol_key, schema in self._backend.list_keys(dataset):
+            meta = self._backend.load_meta(ds, symbol_key, schema)
+            if meta is None:
                 continue
-            for symbol_dir in ds_path.iterdir():
-                if not symbol_dir.is_dir():
-                    continue
-                for schema_dir in symbol_dir.iterdir():
-                    if not schema_dir.is_dir():
-                        continue
-                    meta = self._load_meta(ds, symbol_dir.name, schema_dir.name)
-                    if meta is None:
-                        continue
-                    fixed = self._validate_and_fix_meta(meta)
-                    if fixed is not None:
-                        old_end = meta.ranges[-1].end if meta.ranges else None
-                        new_end = fixed.ranges[-1].end if fixed.ranges else None
-                        msg = f"{old_end} -> {new_end}"
-                        results.append((ds, meta.symbol, meta.schema_, msg))
-                        if fix:
-                            self._save_meta(fixed)
-                            logger.info(
-                                "Fixed metadata for %s/%s: %s",
-                                meta.symbol,
-                                meta.schema_,
-                                msg,
-                            )
+            fixed = self._validate_and_fix_meta(meta)
+            if fixed is not None:
+                old_end = meta.ranges[-1].end if meta.ranges else None
+                new_end = fixed.ranges[-1].end if fixed.ranges else None
+                msg = f"{old_end} -> {new_end}"
+                results.append((ds, meta.symbol, meta.schema_, msg))
+                if fix:
+                    self._backend.save_meta(fixed)
+                    logger.info(
+                        "Fixed metadata for %s/%s: %s",
+                        meta.symbol,
+                        meta.schema_,
+                        msg,
+                    )
 
         return results
 
     def repair_metadata(self, dataset: str | None = None) -> list[tuple[str, str, str]]:
-        """Find and rebuild metadata for orphaned parquet files.
+        """Find and rebuild metadata for orphaned partition data.
 
-        Scans for directories with parquet files but no meta.json,
-        and rebuilds metadata from the files.
+        Scans for stored data that has no metadata and rebuilds it from the data.
 
         Args:
             dataset: Filter by dataset. If None, scan all.
@@ -1246,41 +1083,17 @@ class DataCache:
         """
         repaired: list[tuple[str, str, str]] = []
 
-        if dataset:
-            datasets = [dataset]
-        else:
-            if not self._cache_dir.exists():
-                return []
-            datasets = [d.name for d in self._cache_dir.iterdir() if d.is_dir()]
-
-        for ds in datasets:
-            ds_path = self._cache_dir / ds
-            if not ds_path.exists():
-                continue
-            for symbol_dir in ds_path.iterdir():
-                if not symbol_dir.is_dir():
-                    continue
-                for schema_dir in symbol_dir.iterdir():
-                    if not schema_dir.is_dir():
-                        continue
-
-                    meta_path = schema_dir / "meta.json"
-                    has_parquet = any(schema_dir.rglob("*.parquet"))
-
-                    if has_parquet and not meta_path.exists():
-                        # Orphaned files - rebuild metadata
-                        rebuilt = self._rebuild_meta_from_files(
-                            ds, symbol_dir.name, schema_dir.name
-                        )
-                        if rebuilt:
-                            self._save_meta(rebuilt)
-                            repaired.append((ds, rebuilt.symbol, schema_dir.name))
-                            logger.info(
-                                "Rebuilt metadata for %s/%s/%s",
-                                ds,
-                                rebuilt.symbol,
-                                schema_dir.name,
-                            )
+        for ds, symbol_key, schema in self._backend.list_orphans(dataset):
+            rebuilt = self._rebuild_meta_from_files(ds, symbol_key, schema)
+            if rebuilt:
+                self._backend.save_meta(rebuilt)
+                repaired.append((ds, rebuilt.symbol, schema))
+                logger.info(
+                    "Rebuilt metadata for %s/%s/%s",
+                    ds,
+                    rebuilt.symbol,
+                    schema,
+                )
 
         return repaired
 
@@ -1295,7 +1108,7 @@ class DataCache:
         if not issues:
             return
 
-        meta = self._load_meta(dataset, symbol, schema)
+        meta = self._backend.load_meta(dataset, symbol, schema)
         if meta is None:
             return
 
@@ -1306,7 +1119,7 @@ class DataCache:
                 existing_dates.add(issue.date)
 
         meta.quality_issues.sort(key=lambda i: i.date)
-        self._save_meta(meta)
+        self._backend.save_meta(meta)
 
     def get_quality_issues(
         self,
@@ -1328,7 +1141,7 @@ class DataCache:
         Returns:
             List of quality issues, optionally filtered by date range.
         """
-        meta = self._load_meta(dataset, symbol, schema)
+        meta = self._backend.load_meta(dataset, symbol, schema)
         if meta is None:
             return []
 

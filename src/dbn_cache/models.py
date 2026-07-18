@@ -198,11 +198,7 @@ class CachedData:
 
         dtype = schema["ts_event"]
         is_datetime = dtype == pl.Datetime or str(dtype).startswith("Datetime")
-        ts_ns = (
-            pl.col("ts_event").dt.epoch("ns")
-            if is_datetime
-            else pl.col("ts_event")
-        )
+        ts_ns = pl.col("ts_event").dt.epoch("ns") if is_datetime else pl.col("ts_event")
 
         # end date is inclusive, so we need to include the entire day
         if self._start is not None:

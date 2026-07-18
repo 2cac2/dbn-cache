@@ -29,6 +29,12 @@ dependencies = [
     "exchange-calendars>=4.12",
 ]
 
+[project.optional-dependencies]
+# SQL cache backend (SQLite works out of the box; add a driver for remote DBs).
+sql = ["sqlmodel>=0.0.14"]
+postgres = ["dbn-cache[sql]", "psycopg[binary]>=3.1"]
+mysql = ["dbn-cache[sql]", "pymysql>=1.1"]
+
 [project.scripts]
 dbn = "dbn_cache.cli:main"
 dbn-cache = "dbn_cache.cli:main"
@@ -39,7 +45,14 @@ Repository = "https://github.com/azizuysal/dbn-cache"
 Issues = "https://github.com/azizuysal/dbn-cache/issues"
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-cov>=6.0", "ruff>=0.8", "pyright>=1.1.408", "pandas-stubs>=2.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "pyright>=1.1.408",
+    "pandas-stubs>=2.0",
+    "sqlmodel>=0.0.14",
+]
 
 [build-system]
 requires = ["hatchling"]
