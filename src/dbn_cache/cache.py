@@ -169,6 +169,10 @@ class DataCache:
             )
             return None
 
+    def available_end(self, dataset: str) -> date | None:
+        """Return the last inclusive date with data available for a dataset."""
+        return self._get_available_end(dataset)
+
     def _lock(
         self, dataset: str, symbol: str, schema: str, timeout: float = 300
     ) -> AbstractContextManager[None]:
@@ -814,6 +818,7 @@ class DataCache:
         start: date,
         end: date,
         dataset: str = "GLBX.MDP3",
+        stype: str | None = None,
     ) -> CachedData:
         """Ensure data is cached, downloading if needed.
 
@@ -823,6 +828,7 @@ class DataCache:
             start: Start date
             end: End date
             dataset: Databento dataset
+            stype: Symbol type (stype_in) to pass to the API on download.
 
         Returns:
             CachedData wrapper.
@@ -830,7 +836,7 @@ class DataCache:
         try:
             return self.get(symbol, schema, start, end, dataset)
         except CacheMissError:
-            return self.download(symbol, schema, start, end, dataset)
+            return self.download(symbol, schema, start, end, dataset, stype=stype)
 
     def get_update_range(
         self,

@@ -40,6 +40,13 @@ Default cache locations:
 - **Unix/Mac:** `~/.databento`
 - **Windows:** `%LOCALAPPDATA%\databento`
 
+Optionally cache into a SQL database instead of local files (see
+[SQL cache backend](#sql-cache-backend-centralized-cache)):
+
+```bash
+export DBN_CACHE_URL="sqlite:///path/to/cache.db"
+```
+
 ## CLI Usage
 
 The CLI is available as `dbn` (or `dbn-cache`):
@@ -267,6 +274,68 @@ for dataset, symbol, schema in repaired:
 from pathlib import Path
 cache = DataCache(cache_dir=Path("/path/to/cache"))
 ```
+
+## Databento drop-in (1:1 API)
+
+`dbn_cache.Historical` mirrors `databento.Historical`, so existing Databento code
+works unchanged — just swap the import — and `timeseries.get_range` results are
+cached transparently (like `yfinance-cache` wraps `yfinance`):
+
+```python
+import dbn_cache as db  # instead of: import databento as db
+
+client = db.Historical("YOUR_KEY")  # or set DATABENTO_API_KEY
+
+data = client.timeseries.get_range(
+    dataset="GLBX.MDP3",
+    symbols="ES.c.0",
+    schema="ohlcv-1m",
+    start="2024-01-01",
+    end="2024-02-01",  # end is exclusive, matching databento
+)
+
+df = data.to_df()          # pandas (served from cache on repeat calls)
+pl_df = data.to_polars()   # polars (dbn-cache extension)
+data.to_parquet("es.parquet")
+```
+
+- `metadata`, `symbology`, and `batch` pass through to a real `databento.Historical`.
+- Only `timeseries.get_range` is cached. Requests for `ALL_SYMBOLS` or instrument-id
+  symbols bypass the cache and return a genuine `DBNStore`.
+- The result is a `CacheStore` supporting `.to_df()`, `.to_ndarray()`,
+  `.to_parquet()`, `.to_csv()`, `.to_json()`, and iteration. Operations that need
+  the raw DBN binary (`to_file`, `replay`, `request_symbology`, …) raise
+  `NotImplementedError` — use `databento.Historical` directly for those.
+
+## SQL cache backend (centralized cache)
+
+By default the cache is partitioned Parquet files on disk. You can instead cache
+into a SQL database — a local SQLite file, or a shared PostgreSQL/MySQL server for a
+centralized, remotely-accessible market-data cache.
+
+```bash
+pip install 'dbn-cache[sql]'        # SQLite (built in) via SQLModel/SQLAlchemy
+pip install 'dbn-cache[postgres]'   # + PostgreSQL driver
+pip install 'dbn-cache[mysql]'      # + MySQL driver
+```
+
+Select the backend with a connection URL (in code, or via the `DBN_CACHE_URL`
+environment variable). It works with both `DataCache` and the `Historical` drop-in:
+
+```python
+import dbn_cache as db
+
+# Local SQLite file
+cache = db.DataCache(url="sqlite:///market-data.db")
+
+# Shared PostgreSQL (centralized cache)
+client = db.Historical("YOUR_KEY", url="postgresql://user:pw@host:5432/marketdata")
+```
+
+Data is stored as columnar rows (one table per schema, e.g. `data_ohlcv_1m`) plus a
+`cache_partitions` registry, so the database is directly queryable as market data.
+SQLite is single-writer (ideal for one machine); use PostgreSQL/MySQL for concurrent
+shared access.
 
 ## Supported Symbols
 

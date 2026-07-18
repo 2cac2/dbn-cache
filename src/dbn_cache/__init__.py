@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         parse_contract_symbol,
         to_databento_symbol,
     )
+    from .historical import CacheStore, Historical
     from .models import (
         CacheCheckResult,
         CachedData,
@@ -41,22 +42,40 @@ if TYPE_CHECKING:
         PartitionInfo,
         UpdateAllResult,
     )
+    from .storage import (
+        DataReader,
+        FilesystemBackend,
+        PartitionKey,
+        StorageBackend,
+        create_backend,
+    )
 
 
 __all__ = [
-    "CachedData",
-    "CachedDataInfo",
     "CacheCheckResult",
     "CacheMissError",
     "CacheStatus",
-    "DatabentoClient",
+    "CacheStore",
+    "CachedData",
+    "CachedDataInfo",
     "DataCache",
     "DataQualityIssue",
+    "DataReader",
+    "DatabentoClient",
     "DateRange",
     "DownloadCancelledError",
     "DownloadProgress",
     "DownloadStatus",
     "EmptyDataError",
+    "FilesystemBackend",
+    "Historical",
+    "MissingAPIKeyError",
+    "PartialCacheError",
+    "PartitionInfo",
+    "PartitionKey",
+    "StorageBackend",
+    "UpdateAllResult",
+    "create_backend",
     "generate_quarterly_contracts",
     "get_contract_dates",
     "get_expiration_date",
@@ -64,12 +83,8 @@ __all__ = [
     "get_next_contract",
     "is_supported_contract",
     "is_supported_root",
-    "MissingAPIKeyError",
     "parse_contract_symbol",
-    "PartialCacheError",
-    "PartitionInfo",
     "to_databento_symbol",
-    "UpdateAllResult",
 ]
 
 
@@ -122,4 +137,18 @@ def __getattr__(name: str):
         from . import models
 
         return getattr(models, name)
+    if name in ("Historical", "CacheStore"):
+        from . import historical
+
+        return getattr(historical, name)
+    if name in (
+        "DataReader",
+        "FilesystemBackend",
+        "PartitionKey",
+        "StorageBackend",
+        "create_backend",
+    ):
+        from . import storage
+
+        return getattr(storage, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
