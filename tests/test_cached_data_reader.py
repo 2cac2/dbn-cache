@@ -82,3 +82,32 @@ class TestDatetimeDtypeFilter:
         out = data.to_polars().collect()
         assert out.height == 1
         assert out["v"][0] == 2
+
+    def test_day_boundary_uses_utc_not_local_tz(self, tmp_path: Path) -> None:
+        # A 02:00 UTC bar on 2024-01-02 must be included when requesting that UTC
+        # date, regardless of the machine's local timezone. Under a west-of-UTC
+        # local tz the old local-midnight bound (05:00 UTC) dropped it.
+        import os
+        import time
+
+        prev = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            rows = [datetime(2024, 1, 2, 2, 0, tzinfo=UTC)]
+            df = pl.DataFrame(
+                {
+                    "ts_event": pl.Series(rows).cast(pl.Datetime("ns", "UTC")),
+                    "v": [1],
+                }
+            )
+            path = tmp_path / "tz.parquet"
+            df.write_parquet(path)
+            data = CachedData([path], start=date(2024, 1, 2), end=date(2024, 1, 2))
+            assert data.to_polars().collect().height == 1
+        finally:
+            if prev is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev
+            time.tzset()

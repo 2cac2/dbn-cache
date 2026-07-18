@@ -337,6 +337,10 @@ Data is stored as columnar rows (one table per schema, e.g. `data_ohlcv_1m`) plu
 SQLite is single-writer (ideal for one machine); use PostgreSQL/MySQL for concurrent
 shared access.
 
+> **Note:** SQL `TIMESTAMP` types are microsecond-precision, so SQL backends do not
+> preserve sub-microsecond `ts_event` detail. For nanosecond-precise tick data, use
+> the default filesystem (Parquet) backend.
+
 ## Supported Symbols
 
 ### Stocks

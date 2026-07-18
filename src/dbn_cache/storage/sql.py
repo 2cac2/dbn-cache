@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -31,7 +32,7 @@ import polars as pl
 from filelock import FileLock
 
 try:
-    from sqlalchemy import Engine, inspect, text
+    from sqlalchemy import Connection, Engine, inspect, text
     from sqlmodel import Field, Session, SQLModel, col, create_engine, select
 except ImportError as exc:  # pragma: no cover - import guard
     _MSG = (
@@ -59,7 +60,7 @@ _HELPER_COLUMNS = (
     "_part_month",
     "_part_day",
 )
-_TS_COLUMNS = ("ts_event", "ts_recv")
+_TS_COLUMNS = ("ts_event", "ts_recv", "ts_ref")
 
 
 class CacheMeta(SQLModel, table=True):
@@ -97,6 +98,19 @@ def _data_table_name(schema: str) -> str:
     """Table name for a schema's rows (e.g. ``ohlcv-1m`` -> ``data_ohlcv_1m``)."""
     safe = "".join(c if c.isalnum() else "_" for c in schema)
     return f"data_{safe}"
+
+
+def _sql_type(dtype: pl.DataType) -> str:
+    """Coarse SQL column type for a Polars dtype (used for ADD COLUMN on drift)."""
+    if dtype.is_integer():
+        return "BIGINT"
+    if dtype.is_float():
+        return "DOUBLE PRECISION"
+    if isinstance(dtype, pl.Datetime):
+        return "TIMESTAMP"
+    if dtype == pl.Boolean:
+        return "BOOLEAN"
+    return "TEXT"
 
 
 def _part_ordinal_sql() -> str:
@@ -169,12 +183,26 @@ class DatabaseReader:
         drop = [c for c in _HELPER_COLUMNS if c in df.columns]
         if drop:
             df = df.drop(drop)
-        # SQLite has no native datetime type: timestamps round-trip as strings.
-        casts = [
-            pl.col(c).str.to_datetime(strict=False)
-            for c in _TS_COLUMNS
-            if c in df.columns and df.schema[c] == pl.String
-        ]
+        # Restore timestamp columns to Datetime[ns, UTC] to match the filesystem
+        # backend. SQLite has no native datetime type (values round-trip as
+        # strings); other dialects return naive datetimes. Note: SQL TIMESTAMP
+        # storage is microsecond-precision, so sub-microsecond ts_event detail is
+        # not preserved by SQL backends (use the filesystem backend for that).
+        casts: list[pl.Expr] = []
+        for c in _TS_COLUMNS:
+            if c not in df.columns:
+                continue
+            dtype = df.schema[c]
+            if dtype == pl.String:
+                casts.append(
+                    pl.col(c)
+                    .str.to_datetime(time_unit="ns", strict=False)
+                    .dt.replace_time_zone("UTC")
+                )
+            elif isinstance(dtype, pl.Datetime) and dtype.time_zone is None:
+                casts.append(
+                    pl.col(c).cast(pl.Datetime("ns")).dt.replace_time_zone("UTC")
+                )
         if casts:
             df = df.with_columns(casts)
         return df.lazy()
@@ -226,8 +254,16 @@ class SqlBackend(StorageBackend):
         )
 
         table = _data_table_name(key.schema)
+        start_date = data_range[0].isoformat() if data_range else None
+        end_date = data_range[1].isoformat() if data_range else None
+
+        # Delete-old-rows, append-new-rows, and the registry upsert all run in a
+        # SINGLE transaction. A failed re-commit therefore rolls back cleanly and
+        # can never leave the partition's data gone while the registry still
+        # reports it present (which would suppress the re-download).
         with self._engine.begin() as conn:
-            if self._table_exists(table):
+            if inspect(conn).has_table(table):
+                self._ensure_columns(conn, table, df)
                 conn.execute(
                     text(
                         f"DELETE FROM {table} "  # noqa: S608 - internal table name
@@ -243,54 +279,65 @@ class SqlBackend(StorageBackend):
                         "day": part_day,
                     },
                 )
+            df.write_database(table, connection=conn, if_table_exists="append")
+            self._upsert_partition_row(
+                conn, key, part_day, df.height, start_date, end_date
+            )
 
-        df.write_database(table, self._engine, if_table_exists="append")
+    def _ensure_columns(self, conn: Connection, table: str, df: pl.DataFrame) -> None:
+        """Add any columns present in df but missing from the table (schema drift)."""
+        existing = {c["name"] for c in inspect(conn).get_columns(table)}
+        for name, dtype in df.schema.items():
+            if name not in existing:
+                conn.execute(
+                    text(
+                        f'ALTER TABLE {table} ADD COLUMN "{name}" {_sql_type(dtype)}'  # noqa: S608
+                    )
+                )
 
-        self._upsert_partition(
-            key,
-            part_day,
-            df.height,
-            data_range[0].isoformat() if data_range else None,
-            data_range[1].isoformat() if data_range else None,
-        )
-
-    def _upsert_partition(
+    def _upsert_partition_row(
         self,
+        conn: Connection,
         key: PartitionKey,
         part_day: int,
         row_count: int,
         start_date: str | None,
         end_date: str | None,
     ) -> None:
-        with Session(self._engine) as session:
-            obj = session.get(
-                CachePartition,
-                (
-                    key.dataset,
-                    key.symbol_normalized,
-                    key.schema,
-                    key.year,
-                    key.month,
-                    part_day,
-                ),
-            )
-            if obj is None:
-                obj = CachePartition(
-                    dataset=key.dataset,
-                    symbol_normalized=key.symbol_normalized,
-                    schema_name=key.schema,
-                    part_year=key.year,
-                    part_month=key.month,
-                    part_day=part_day,
-                )
-            obj.stype = detect_stype(key.symbol)
-            obj.granularity = key.granularity
-            obj.start_date = start_date
-            obj.end_date = end_date
-            obj.row_count = row_count
-            obj.fetched_at = datetime.now(UTC).isoformat()
-            session.add(obj)
-            session.commit()
+        pk = {
+            "d": key.dataset,
+            "s": key.symbol_normalized,
+            "sc": key.schema,
+            "y": key.year,
+            "m": key.month,
+            "day": part_day,
+        }
+        conn.execute(
+            text(
+                "DELETE FROM cache_partitions WHERE dataset = :d "
+                "AND symbol_normalized = :s AND schema_name = :sc "
+                "AND part_year = :y AND part_month = :m AND part_day = :day"
+            ),
+            pk,
+        )
+        conn.execute(
+            text(
+                "INSERT INTO cache_partitions (dataset, symbol_normalized, "
+                "schema_name, part_year, part_month, part_day, stype, granularity, "
+                "start_date, end_date, row_count, fetched_at) VALUES "
+                "(:d, :s, :sc, :y, :m, :day, :stype, :gran, :start, :end, "
+                ":rows, :fetched)"
+            ),
+            {
+                **pk,
+                "stype": detect_stype(key.symbol),
+                "gran": key.granularity,
+                "start": start_date,
+                "end": end_date,
+                "rows": row_count,
+                "fetched": datetime.now(UTC).isoformat(),
+            },
+        )
 
     def partition_exists(self, key: PartitionKey) -> bool:
         part_day = key.day if key.day is not None else 0
@@ -470,23 +517,44 @@ class SqlBackend(StorageBackend):
         name = f"{dataset}/{normalize_symbol(symbol)}/{schema}"
         digest = hashlib.sha1(name.encode()).digest()  # noqa: S324 - lock key only
         key = int.from_bytes(digest[:8], "big", signed=True)
+        lock_name = digest[:8].hex()
         conn = self._engine.connect()
+        acquired = False
         try:
             if self._dialect == "postgresql":
-                conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": key})
+                # pg_advisory_lock() blocks forever; poll pg_try_advisory_lock()
+                # so the timeout contract is honored.
+                deadline = time.monotonic() + timeout
+                while True:
+                    got = conn.execute(
+                        text("SELECT pg_try_advisory_lock(:k)"), {"k": key}
+                    ).scalar()
+                    if got:
+                        acquired = True
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"advisory lock for {name} not acquired in {timeout}s"
+                        )
+                    time.sleep(0.1)
             else:  # mysql / mariadb
-                conn.execute(
+                got = conn.execute(
                     text("SELECT GET_LOCK(:k, :t)"),
-                    {"k": digest[:8].hex(), "t": int(timeout)},
-                )
+                    {"k": lock_name, "t": int(timeout)},
+                ).scalar()
+                if got != 1:
+                    msg = f"Could not acquire lock for {name} in {timeout}s"
+                    raise TimeoutError(msg)
+                acquired = True
             conn.commit()
             yield
         finally:
-            if self._dialect == "postgresql":
-                conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
-            else:
-                conn.execute(text("SELECT RELEASE_LOCK(:k)"), {"k": digest[:8].hex()})
-            conn.commit()
+            if acquired:
+                if self._dialect == "postgresql":
+                    conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+                else:
+                    conn.execute(text("SELECT RELEASE_LOCK(:k)"), {"k": lock_name})
+                conn.commit()
             conn.close()
 
     def cleanup(self, dataset: str, symbol: str, schema: str) -> None:

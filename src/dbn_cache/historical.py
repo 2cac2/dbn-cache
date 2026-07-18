@@ -78,6 +78,26 @@ def _epoch_ns(dt: datetime) -> int:
     return int(dt.timestamp() * _NANOS_PER_SECOND)
 
 
+def _resolve_start(start: object) -> tuple[int, date]:
+    """Return (inclusive start ns, start date). Bare ints are UNIX nanoseconds."""
+    if isinstance(start, int):
+        return start, datetime.fromtimestamp(start / 1e9, tz=UTC).date()
+    start_dt = _coerce_datetime(start)
+    return _epoch_ns(start_dt), start_dt.date()
+
+
+def _resolve_end(end: object) -> tuple[int, date]:
+    """Return (exclusive end ns, inclusive end date). Bare ints are UNIX ns.
+
+    databento's end is exclusive; the inclusive end date is that of the last
+    instant actually included (end - 1 ns).
+    """
+    if isinstance(end, int):
+        return end, datetime.fromtimestamp((end - 1) / 1e9, tz=UTC).date()
+    end_dt = _coerce_datetime(end)
+    return _epoch_ns(end_dt), (end_dt - timedelta(microseconds=1)).date()
+
+
 class CacheStore:
     """DBNStore-compatible view over cached rows for a get_range request.
 
@@ -128,6 +148,10 @@ class CacheStore:
                 lf = lf.filter(ts_ns >= self._start_ns)
             if self._end_ns is not None:
                 lf = lf.filter(ts_ns < self._end_ns)  # databento end is exclusive
+            if len(self._cached) > 1:
+                # databento returns records ordered by ts_event; a multi-symbol
+                # union must be re-sorted to preserve that contract.
+                lf = lf.sort("ts_event")
         return lf
 
     def to_polars(self) -> pl.DataFrame:
@@ -238,6 +262,10 @@ class _CachedTimeseries:
         path: str | Path | None = None,
     ) -> Any:
         """Cached ``timeseries.get_range`` (see :mod:`dbn_cache.historical`)."""
+        # Materialize an iterable of symbols once so that, on the uncacheable
+        # passthrough path, we don't forward an already-exhausted iterator.
+        if symbols is not None and not isinstance(symbols, (str, int)):
+            symbols = list(symbols)
         symbol_list = _normalize_symbols(symbols)
         if symbol_list is None:
             # Uncacheable (ALL_SYMBOLS / instrument ids / None): pass through.
@@ -253,9 +281,7 @@ class _CachedTimeseries:
                 path=path,
             )
 
-        start_dt = _coerce_datetime(start)
-        start_ns = _epoch_ns(start_dt)
-        start_date = start_dt.date()
+        start_ns, start_date = _resolve_start(start)
 
         if end is None:
             inclusive_end = self._cache.available_end(dataset)
@@ -263,9 +289,7 @@ class _CachedTimeseries:
                 inclusive_end = datetime.now(UTC).date() - timedelta(days=1)
             end_ns = None
         else:
-            end_dt = _coerce_datetime(end)
-            end_ns = _epoch_ns(end_dt)
-            inclusive_end = (end_dt - timedelta(microseconds=1)).date()
+            end_ns, inclusive_end = _resolve_end(end)
 
         cached: list[CachedData] = []
         for symbol in symbol_list:

@@ -169,3 +169,70 @@ class TestBackendParity:
         _mock_ohlcv(cache, [1, 31])
         cache.download("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
         assert cache.validate_metadata() == []
+
+    def test_ts_event_dtype_is_ns_utc(self, cache: DataCache) -> None:
+        # Both backends return ts_event as Datetime[ns, UTC] (backend parity).
+        _mock_ohlcv(cache, [2, 15, 28])
+        cache.download("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+        got = cache.get("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+        dtype = got.to_polars().collect().schema["ts_event"]
+        assert str(dtype) == "Datetime(time_unit='ns', time_zone='UTC')"
+
+    def test_multi_symbol_isolation(self, cache: DataCache) -> None:
+        # Two symbols in the same schema must not leak into each other's reads
+        # (critical for the SQL backend's shared data_<schema> table).
+        _mock_ohlcv(cache, [2, 15, 28])
+        cache.download("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+        cache.download("NQ.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+        es = cache.get("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+        assert es.to_polars().collect().height == 3  # not 6
+        assert {i.symbol for i in cache.list_cached()} == {"ES.c.0", "NQ.c.0"}
+
+    def test_quality_issues_roundtrip(self, cache: DataCache) -> None:
+        from dbn_cache.models import DataQualityIssue, DateRange, SymbolMeta
+
+        meta = SymbolMeta(
+            dataset="GLBX.MDP3",
+            symbol="ES.c.0",
+            stype="continuous",
+            schema="ohlcv-1m",
+            ranges=[DateRange(start=date(2024, 1, 1), end=date(2024, 1, 31))],
+            updated_at=datetime(2024, 2, 1),
+            quality_issues=[
+                DataQualityIssue(date=date(2024, 1, 5), issue_type="degraded")
+            ],
+        )
+        cache.backend.save_meta(meta)
+        issues = cache.get_quality_issues("ES.c.0", "ohlcv-1m")
+        assert len(issues) == 1
+        assert issues[0].issue_type == "degraded"
+        assert issues[0].date == date(2024, 1, 5)
+
+
+class TestSqlAtomicity:
+    def test_failed_recommit_preserves_data(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dbn_cache.storage.base import PartitionKey
+
+        cache = DataCache(url=f"sqlite:///{tmp_path / 'c.db'}", cache_dir=tmp_path)
+        _mock_ohlcv(cache, [2, 15])
+        cache.download("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+
+        # Force the append to fail during a re-commit of the same partition.
+        stage = tmp_path / "stage.parquet"
+        _ohlcv([2, 15]).write_parquet(stage)
+
+        def boom(self: pl.DataFrame, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("simulated append failure")
+
+        monkeypatch.setattr(pl.DataFrame, "write_database", boom)
+        key = PartitionKey("GLBX.MDP3", "ES.c.0", "ohlcv-1m", 2024, 1, None)
+        with pytest.raises(RuntimeError):
+            cache.backend.commit_partition(key, stage)
+        monkeypatch.undo()
+
+        # Rollback: old rows intact, registry still consistent.
+        got = cache.get("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 1, 31))
+        assert got.to_polars().collect().height == 2
+        assert cache.backend.partition_exists(key) is True

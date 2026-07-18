@@ -536,12 +536,13 @@ class DataCache:
         symbol: str,
         schema: str,
         cached_ranges: list[DateRange],
+        stype: str | None = None,
     ) -> None:
         """Save metadata with current progress."""
         new_meta = SymbolMeta(
             dataset=dataset,
             symbol=symbol,
-            stype=detect_stype(symbol),
+            stype=stype or detect_stype(symbol),
             schema=schema,
             ranges=self._merge_ranges(cached_ranges),
             updated_at=datetime.now(UTC),
@@ -742,7 +743,7 @@ class DataCache:
                         # (e.g., June 30 + 1 = July 1)
                         completed_ranges.append(DateRange(start=dl_start, end=dl_end))
                         self._save_incremental_meta(
-                            dataset, symbol, schema, completed_ranges
+                            dataset, symbol, schema, completed_ranges, stype
                         )
 
                         if on_progress:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -162,6 +163,43 @@ class TestGetRange:
         )
         assert {c[0] for c in calls} == {"ES.c.0", "NQ.c.0"}
         assert store.to_polars().height == 4
+
+    def test_multiple_symbols_time_sorted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # databento returns records ordered by ts_event; a multi-symbol union
+        # must be re-sorted (not ES-block-then-NQ-block).
+        client, _ = _make_client(tmp_path, [2, 4], monkeypatch)
+        store = client.timeseries.get_range(
+            dataset="GLBX.MDP3",
+            symbols=["ES.c.0", "NQ.c.0"],
+            schema="ohlcv-1m",
+            start="2024-01-01",
+            end="2024-02-01",
+        )
+        ts = [t.day for t in store.to_polars()["ts_event"].to_list()]
+        assert ts == sorted(ts)
+        assert ts == [2, 2, 4, 4]
+
+    def test_generator_symbols_not_exhausted_on_passthrough(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = Historical(key=KEY, cache_dir=tmp_path)
+        mock_real = MagicMock()
+        monkeypatch.setattr(client, "_real", mock_real)
+
+        def gen() -> Iterator[int]:
+            yield 12345  # instrument id -> uncacheable, forces passthrough
+
+        client.timeseries.get_range(
+            dataset="GLBX.MDP3",
+            symbols=gen(),
+            schema="ohlcv-1m",
+            start="2024-01-01",
+            end="2024-02-01",
+        )
+        _, kwargs = mock_real.timeseries.get_range.call_args
+        assert list(kwargs["symbols"]) == [12345]
 
     def test_to_parquet_and_csv(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

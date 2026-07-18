@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -200,16 +200,21 @@ class CachedData:
         is_datetime = dtype == pl.Datetime or str(dtype).startswith("Datetime")
         ts_ns = pl.col("ts_event").dt.epoch("ns") if is_datetime else pl.col("ts_event")
 
+        # ts_event is compared in UTC epoch nanoseconds, so build the day bounds
+        # in UTC too (not the machine's local timezone).
         # end date is inclusive, so we need to include the entire day
         if self._start is not None:
             start_ns = int(
-                datetime.combine(self._start, datetime.min.time()).timestamp() * 1e9
+                datetime.combine(
+                    self._start, datetime.min.time(), tzinfo=UTC
+                ).timestamp()
+                * 1e9
             )
             lf = lf.filter(ts_ns >= start_ns)
 
         if self._end is not None:
             # End of day (23:59:59.999999999) for inclusive end date
-            end_dt = datetime.combine(self._end, datetime.min.time())
+            end_dt = datetime.combine(self._end, datetime.min.time(), tzinfo=UTC)
             end_ns = int((end_dt.timestamp() + 86400) * 1e9) - 1
             lf = lf.filter(ts_ns <= end_ns)
 
