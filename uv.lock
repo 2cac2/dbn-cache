@@ -295,19 +295,15 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "rich" },
+    { name = "sqlmodel" },
 ]
 
 [package.optional-dependencies]
 mysql = [
     { name = "pymysql" },
-    { name = "sqlmodel" },
 ]
 postgres = [
     { name = "psycopg", extra = ["binary"] },
-    { name = "sqlmodel" },
-]
-sql = [
-    { name = "sqlmodel" },
 ]
 
 [package.dev-dependencies]
@@ -317,15 +313,12 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "sqlmodel" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "databento", specifier = ">=0.40" },
-    { name = "dbn-cache", extras = ["sql"], marker = "extra == 'mysql'" },
-    { name = "dbn-cache", extras = ["sql"], marker = "extra == 'postgres'" },
     { name = "exchange-calendars", specifier = ">=4.12" },
     { name = "filelock", specifier = ">=3.0" },
     { name = "pandas", specifier = ">=2.0,<3" },
@@ -335,9 +328,9 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pymysql", marker = "extra == 'mysql'", specifier = ">=1.1" },
     { name = "rich", specifier = ">=13.0" },
-    { name = "sqlmodel", marker = "extra == 'sql'", specifier = ">=0.0.14" },
+    { name = "sqlmodel", specifier = ">=0.0.14" },
 ]
-provides-extras = ["sql", "postgres", "mysql"]
+provides-extras = ["postgres", "mysql"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -346,7 +339,6 @@ dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "ruff", specifier = ">=0.8" },
-    { name = "sqlmodel", specifier = ">=0.0.14" },
 ]
 
 [[package]]

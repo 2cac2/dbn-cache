@@ -221,6 +221,12 @@ class SqlBackend(StorageBackend):
         self._dialect = self._engine.dialect.name
         self._cache_dir = Path(cache_dir) if cache_dir else get_default_cache_dir()
         self._lock_dir = self._cache_dir / ".sqllocks"
+        # Ensure the SQLite database file's parent directory exists so a default
+        # or fresh path connects cleanly.
+        if self._dialect == "sqlite":
+            db_file = self._engine.url.database
+            if db_file and db_file != ":memory:":
+                Path(db_file).parent.mkdir(parents=True, exist_ok=True)
         SQLModel.metadata.create_all(self._engine)
 
     @property

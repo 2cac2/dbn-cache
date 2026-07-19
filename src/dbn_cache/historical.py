@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -35,10 +36,10 @@ from .cache import DataCache
 from .client import DatabentoClient
 from .exceptions import MissingAPIKeyError
 from .models import CachedData
+from .utils import get_default_cache_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
-    from pathlib import Path
 
     import pandas as pd
 
@@ -346,13 +347,21 @@ class Historical:
     ) -> None:
         """Create a caching historical client.
 
+        Caches to a SQL database by default. With no ``storage``/``url`` (and no
+        ``DBN_CACHE_URL`` env var) it uses a local SQLite file at
+        ``<cache_dir>/cache.db`` (``cache_dir`` defaults to ``~/.databento`` or
+        ``DATABENTO_CACHE_DIR``). Point ``url`` at PostgreSQL/MySQL for a shared,
+        centralized cache, or pass ``url="file:///path"`` / a ``FilesystemBackend``
+        as ``storage`` to cache to Parquet files instead.
+
         Args:
             key: Databento API key. Falls back to the ``DATABENTO_API_KEY`` env var.
             gateway: Optional databento gateway override.
-            cache_dir: Filesystem cache directory (filesystem backend).
+            cache_dir: Base directory for the default SQLite file and lock files.
             storage: An explicit storage backend (overrides ``url``).
-            url: A SQL connection URL (e.g. ``sqlite:///cache.db``) to cache into a
-                database instead of local files. Falls back to ``DBN_CACHE_URL``.
+            url: A SQL connection URL (e.g. ``sqlite:///cache.db``,
+                ``postgresql://user:pw@host/db``), or ``file:///path`` for the
+                filesystem backend. Falls back to ``DBN_CACHE_URL``.
         """
         import databento as databento_mod
 
@@ -367,11 +376,22 @@ class Historical:
         else:
             self._real = databento_mod.Historical(resolved)
 
+        # Default the drop-in to SQLite when nothing else is configured.
+        resolved_url = (
+            url
+            or os.environ.get("DBN_CACHE_URL")
+            or os.environ.get("DATABENTO_CACHE_URL")
+        )
+        if storage is None and resolved_url is None:
+            env_dir = os.environ.get("DATABENTO_CACHE_DIR")
+            base = cache_dir or (Path(env_dir) if env_dir else get_default_cache_dir())
+            resolved_url = f"sqlite:///{base / 'cache.db'}"
+
         self._cache = DataCache(
             cache_dir=cache_dir,
             client=DatabentoClient(api_key=resolved),
             storage=storage,
-            url=url,
+            url=resolved_url,
         )
         self.timeseries = _CachedTimeseries(self._cache, lambda: self._real)
 

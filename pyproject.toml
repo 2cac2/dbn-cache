@@ -27,13 +27,15 @@ dependencies = [
     "filelock>=3.0",
     "rich>=13.0",
     "exchange-calendars>=4.12",
+    # SQL cache backend. The Historical drop-in caches to SQLite by default;
+    # SQLite itself needs no extra driver.
+    "sqlmodel>=0.0.14",
 ]
 
 [project.optional-dependencies]
-# SQL cache backend (SQLite works out of the box; add a driver for remote DBs).
-sql = ["sqlmodel>=0.0.14"]
-postgres = ["dbn-cache[sql]", "psycopg[binary]>=3.1"]
-mysql = ["dbn-cache[sql]", "pymysql>=1.1"]
+# Drivers for using a remote SQL database as the centralized cache.
+postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.1"]
 
 [project.scripts]
 dbn = "dbn_cache.cli:main"
@@ -51,7 +53,6 @@ dev = [
     "ruff>=0.8",
     "pyright>=1.1.408",
     "pandas-stubs>=2.0",
-    "sqlmodel>=0.0.14",
 ]
 
 [build-system]

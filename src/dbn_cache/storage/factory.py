@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from .base import StorageBackend
 
 # SQLAlchemy URL schemes routed to the SQL backend. DuckDB works opportunistically
@@ -37,14 +36,25 @@ def create_backend(url: str, cache_dir: Path | None = None) -> StorageBackend:
 
     Args:
         url: A SQLAlchemy-style connection URL (e.g. ``sqlite:///cache.db``,
-            ``postgresql://user:pw@host/db``).
+            ``postgresql://user:pw@host/db``), or ``file:///path`` to select the
+            filesystem (Parquet-on-disk) backend explicitly.
         cache_dir: Directory for sidecar lock files (and the SQLite file's parent
             when a relative SQLite path is used).
 
     Raises:
-        ValueError: If the URL scheme is not a supported SQL dialect.
+        ValueError: If the URL scheme is not supported.
     """
     scheme = scheme_of(url)
+    if scheme in ("file", "filesystem"):
+        from ..utils import get_default_cache_dir
+        from .filesystem import FilesystemBackend
+
+        path_part = url.split("://", 1)[1] if "://" in url else ""
+        if path_part:
+            directory = Path(path_part)
+        else:
+            directory = cache_dir or get_default_cache_dir()
+        return FilesystemBackend(directory)
     if scheme in SQL_SCHEMES:
         from .sql import SqlBackend
 
@@ -52,6 +62,7 @@ def create_backend(url: str, cache_dir: Path | None = None) -> StorageBackend:
     msg = (
         f"Unsupported cache URL scheme: {scheme!r}. "
         "Use a SQLAlchemy connection URL such as 'sqlite:///path/to/cache.db', "
-        "'postgresql://user:pw@host/db', or 'mysql://user:pw@host/db'."
+        "'postgresql://user:pw@host/db', 'mysql://user:pw@host/db', or "
+        "'file:///path/to/dir' for the filesystem backend."
     )
     raise ValueError(msg)

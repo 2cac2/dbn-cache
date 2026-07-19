@@ -264,6 +264,23 @@ class TestConstruction:
         client = Historical(cache_dir=tmp_path)
         assert client.cache is not None
 
+    def test_defaults_to_sqlite_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dbn_cache.storage.sql import SqlBackend
+
+        monkeypatch.delenv("DBN_CACHE_URL", raising=False)
+        monkeypatch.delenv("DATABENTO_CACHE_URL", raising=False)
+        client = Historical(key=KEY, cache_dir=tmp_path)
+        assert isinstance(client.cache.backend, SqlBackend)
+        assert (tmp_path / "cache.db").exists()
+
+    def test_file_url_selects_filesystem(self, tmp_path: Path) -> None:
+        from dbn_cache.storage.filesystem import FilesystemBackend
+
+        client = Historical(key=KEY, url=f"file://{tmp_path}/fs")
+        assert isinstance(client.cache.backend, FilesystemBackend)
+
 
 class TestUnsupported:
     def test_raw_dbn_ops_raise(

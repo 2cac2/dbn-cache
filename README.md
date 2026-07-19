@@ -40,11 +40,13 @@ Default cache locations:
 - **Unix/Mac:** `~/.databento`
 - **Windows:** `%LOCALAPPDATA%\databento`
 
-Optionally cache into a SQL database instead of local files (see
-[SQL cache backend](#sql-cache-backend-centralized-cache)):
+The `Historical` drop-in caches to SQLite (`<cache_dir>/cache.db`) by default.
+Point the cache at a different database — or force a specific backend — with a
+connection URL (see [SQL cache backend](#sql-cache-backend-centralized-cache)):
 
 ```bash
-export DBN_CACHE_URL="sqlite:///path/to/cache.db"
+export DBN_CACHE_URL="postgresql://user:pw@host:5432/marketdata"  # shared DB
+# export DBN_CACHE_URL="file:///path/to/dir"                      # Parquet on disk
 ```
 
 ## CLI Usage
@@ -299,6 +301,17 @@ pl_df = data.to_polars()   # polars (dbn-cache extension)
 data.to_parquet("es.parquet")
 ```
 
+The drop-in **caches to SQLite by default** — no configuration needed. With no
+`url`/`storage`, it uses `<cache_dir>/cache.db` (`cache_dir` defaults to
+`~/.databento` or `DATABENTO_CACHE_DIR`). Point it at a shared database for a
+centralized cache, or opt into Parquet-on-disk:
+
+```python
+db.Historical("YOUR_KEY")                                                # SQLite (default)
+db.Historical("YOUR_KEY", url="postgresql://user:pw@host:5432/market")   # shared Postgres
+db.Historical("YOUR_KEY", url="file:///path/to/dir")                     # Parquet on disk
+```
+
 - `metadata`, `symbology`, and `batch` pass through to a real `databento.Historical`.
 - Only `timeseries.get_range` is cached. Requests for `ALL_SYMBOLS` or instrument-id
   symbols bypass the cache and return a genuine `DBNStore`.
@@ -309,23 +322,22 @@ data.to_parquet("es.parquet")
 
 ## SQL cache backend (centralized cache)
 
-By default the cache is partitioned Parquet files on disk. You can instead cache
-into a SQL database — a local SQLite file, or a shared PostgreSQL/MySQL server for a
-centralized, remotely-accessible market-data cache.
+The `Historical` drop-in caches to SQLite by default; the SQL backend also works
+with `DataCache` (which itself still defaults to Parquet-on-disk). SQLite needs no
+extra install; add a driver for a remote database:
 
 ```bash
-pip install 'dbn-cache[sql]'        # SQLite (built in) via SQLModel/SQLAlchemy
 pip install 'dbn-cache[postgres]'   # + PostgreSQL driver
 pip install 'dbn-cache[mysql]'      # + MySQL driver
 ```
 
 Select the backend with a connection URL (in code, or via the `DBN_CACHE_URL`
-environment variable). It works with both `DataCache` and the `Historical` drop-in:
+environment variable):
 
 ```python
 import dbn_cache as db
 
-# Local SQLite file
+# Local SQLite file (also the Historical default)
 cache = db.DataCache(url="sqlite:///market-data.db")
 
 # Shared PostgreSQL (centralized cache)
@@ -339,7 +351,7 @@ shared access.
 
 > **Note:** SQL `TIMESTAMP` types are microsecond-precision, so SQL backends do not
 > preserve sub-microsecond `ts_event` detail. For nanosecond-precise tick data, use
-> the default filesystem (Parquet) backend.
+> the filesystem (Parquet) backend (`url="file:///path"`).
 
 ## Supported Symbols
 
