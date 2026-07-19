@@ -221,23 +221,33 @@ class SqlBackend(StorageBackend):
         self._dialect = self._engine.dialect.name
         self._cache_dir = Path(cache_dir) if cache_dir else get_default_cache_dir()
         self._lock_dir = self._cache_dir / ".sqllocks"
-        # Ensure the SQLite database file's parent directory exists so a default
-        # or fresh path connects cleanly.
+        self._ready = False
+
+    @property
+    def cache_dir(self) -> Path:
+        return self._cache_dir
+
+    def _ensure_ready(self) -> None:
+        """Create the SQLite file's parent dir and the core tables on first use.
+
+        Deferred from __init__ so merely constructing the backend never touches
+        the disk/database.
+        """
+        if self._ready:
+            return
         if self._dialect == "sqlite":
             db_file = self._engine.url.database
             if db_file and db_file != ":memory:":
                 Path(db_file).parent.mkdir(parents=True, exist_ok=True)
         SQLModel.metadata.create_all(self._engine)
-
-    @property
-    def cache_dir(self) -> Path:
-        return self._cache_dir
+        self._ready = True
 
     def _table_exists(self, table: str) -> bool:
         return inspect(self._engine).has_table(table)
 
     # -- partition data -----------------------------------------------------
     def commit_partition(self, key: PartitionKey, src_parquet: Path) -> None:
+        self._ensure_ready()
         df = pl.read_parquet(src_parquet)
         data_range = _df_date_range(df)
 
@@ -346,6 +356,7 @@ class SqlBackend(StorageBackend):
         )
 
     def partition_exists(self, key: PartitionKey) -> bool:
+        self._ensure_ready()
         part_day = key.day if key.day is not None else 0
         with Session(self._engine) as session:
             obj = session.get(
@@ -362,6 +373,7 @@ class SqlBackend(StorageBackend):
             return obj is not None
 
     def delete_partition(self, key: PartitionKey) -> bool:
+        self._ensure_ready()
         part_day = key.day if key.day is not None else 0
         table = _data_table_name(key.schema)
         with self._engine.begin() as conn:
@@ -402,6 +414,7 @@ class SqlBackend(StorageBackend):
     def read_range(
         self, dataset: str, symbol: str, schema: str, start: date, end: date
     ) -> DataReader:
+        self._ensure_ready()
         symbol_norm = normalize_symbol(symbol)
         table = _data_table_name(schema)
         if not self._table_exists(table):
@@ -417,6 +430,7 @@ class SqlBackend(StorageBackend):
 
     # -- metadata -----------------------------------------------------------
     def load_meta(self, dataset: str, symbol: str, schema: str) -> SymbolMeta | None:
+        self._ensure_ready()
         with Session(self._engine) as session:
             obj = session.get(CacheMeta, (dataset, normalize_symbol(symbol), schema))
             if obj is None:
@@ -425,6 +439,7 @@ class SqlBackend(StorageBackend):
         return SymbolMeta.model_validate(json.loads(payload))
 
     def save_meta(self, meta: SymbolMeta) -> None:
+        self._ensure_ready()
         symbol_norm = normalize_symbol(meta.symbol)
         payload = json.dumps(meta.model_dump(by_alias=True), default=str)
         with Session(self._engine) as session:
@@ -441,6 +456,7 @@ class SqlBackend(StorageBackend):
             session.commit()
 
     def delete_meta(self, dataset: str, symbol: str, schema: str) -> None:
+        self._ensure_ready()
         with Session(self._engine) as session:
             obj = session.get(CacheMeta, (dataset, normalize_symbol(symbol), schema))
             if obj is not None:
@@ -449,6 +465,7 @@ class SqlBackend(StorageBackend):
 
     # -- introspection / repair --------------------------------------------
     def list_keys(self, dataset: str | None = None) -> list[tuple[str, str, str]]:
+        self._ensure_ready()
         stmt = select(CacheMeta)
         if dataset:
             stmt = stmt.where(col(CacheMeta.dataset) == dataset)
@@ -457,6 +474,7 @@ class SqlBackend(StorageBackend):
         return [(o.dataset, o.symbol_normalized, o.schema_name) for o in objs]
 
     def list_orphans(self, dataset: str | None = None) -> list[tuple[str, str, str]]:
+        self._ensure_ready()
         with Session(self._engine) as session:
             parts = session.exec(select(CachePartition)).all()
             metas = session.exec(select(CacheMeta)).all()
@@ -472,6 +490,7 @@ class SqlBackend(StorageBackend):
     def _partitions_for(
         self, dataset: str, symbol: str, schema: str
     ) -> list[CachePartition]:
+        self._ensure_ready()
         stmt = select(CachePartition).where(
             col(CachePartition.dataset) == dataset,
             col(CachePartition.symbol_normalized) == normalize_symbol(symbol),
@@ -520,6 +539,7 @@ class SqlBackend(StorageBackend):
     def _advisory_lock(
         self, dataset: str, symbol: str, schema: str, timeout: float
     ) -> Iterator[None]:
+        self._ensure_ready()
         name = f"{dataset}/{normalize_symbol(symbol)}/{schema}"
         digest = hashlib.sha1(name.encode()).digest()  # noqa: S324 - lock key only
         key = int.from_bytes(digest[:8], "big", signed=True)

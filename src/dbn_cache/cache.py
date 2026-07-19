@@ -34,7 +34,6 @@ from .models import (
 )
 from .storage.base import PartitionKey, StorageBackend
 from .storage.factory import create_backend
-from .storage.filesystem import FilesystemBackend
 from .utils import (
     detect_stype,
     find_missing_date_ranges,
@@ -100,15 +99,19 @@ class DataCache:
     ) -> None:
         """Initialize cache.
 
+        Caches to SQLite by default. With no ``storage``/``url`` (and no
+        ``DBN_CACHE_URL`` env var) it uses a local SQLite file at
+        ``<cache_dir>/cache.db``.
+
         Args:
-            cache_dir: Cache directory for the filesystem backend. Defaults to
-                ~/.databento or DATABENTO_CACHE_DIR. Also used for sidecar lock
-                files when a SQL backend is selected.
+            cache_dir: Base directory for the default SQLite file and lock files.
+                Defaults to ~/.databento or DATABENTO_CACHE_DIR.
             client: DatabentoClient instance. Created on demand if not provided.
             storage: An explicit StorageBackend. Takes precedence over url.
             url: A SQLAlchemy connection URL (e.g. 'sqlite:///cache.db',
-                'postgresql://user:pw@host/db') selecting a SQL backend. If not
-                given, the DBN_CACHE_URL / DATABENTO_CACHE_URL env vars are used.
+                'postgresql://user:pw@host/db'), or 'file:///path' for the
+                filesystem (Parquet) backend. If not given, the DBN_CACHE_URL /
+                DATABENTO_CACHE_URL env vars are used, else a default SQLite file.
         """
         if storage is not None:
             self._backend: StorageBackend = storage
@@ -118,13 +121,16 @@ class DataCache:
                 or os.environ.get("DBN_CACHE_URL")
                 or os.environ.get("DATABENTO_CACHE_URL")
             )
-            if resolved_url:
-                self._backend = create_backend(resolved_url, cache_dir)
+            if resolved_url is None:
+                # Default to a local SQLite database at <cache_dir>/cache.db.
+                env_dir = os.environ.get("DATABENTO_CACHE_DIR")
+                base = cache_dir or (
+                    Path(env_dir) if env_dir else get_default_cache_dir()
+                )
+                resolved_url = f"sqlite:///{base / 'cache.db'}"
+                self._backend = create_backend(resolved_url, base)
             else:
-                if cache_dir is None:
-                    env_dir = os.environ.get("DATABENTO_CACHE_DIR")
-                    cache_dir = Path(env_dir) if env_dir else get_default_cache_dir()
-                self._backend = FilesystemBackend(cache_dir)
+                self._backend = create_backend(resolved_url, cache_dir)
 
         self._cache_dir = self._backend.cache_dir
         self._client = client

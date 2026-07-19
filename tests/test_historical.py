@@ -273,6 +273,9 @@ class TestConstruction:
         monkeypatch.delenv("DATABENTO_CACHE_URL", raising=False)
         client = Historical(key=KEY, cache_dir=tmp_path)
         assert isinstance(client.cache.backend, SqlBackend)
+        # The SQLite file is created lazily on first use, not on construction.
+        assert not (tmp_path / "cache.db").exists()
+        client.cache.list_cached()
         assert (tmp_path / "cache.db").exists()
 
     def test_file_url_selects_filesystem(self, tmp_path: Path) -> None:

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -36,10 +35,10 @@ from .cache import DataCache
 from .client import DatabentoClient
 from .exceptions import MissingAPIKeyError
 from .models import CachedData
-from .utils import get_default_cache_dir
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
+    from pathlib import Path
 
     import pandas as pd
 
@@ -376,22 +375,12 @@ class Historical:
         else:
             self._real = databento_mod.Historical(resolved)
 
-        # Default the drop-in to SQLite when nothing else is configured.
-        resolved_url = (
-            url
-            or os.environ.get("DBN_CACHE_URL")
-            or os.environ.get("DATABENTO_CACHE_URL")
-        )
-        if storage is None and resolved_url is None:
-            env_dir = os.environ.get("DATABENTO_CACHE_DIR")
-            base = cache_dir or (Path(env_dir) if env_dir else get_default_cache_dir())
-            resolved_url = f"sqlite:///{base / 'cache.db'}"
-
+        # DataCache defaults to SQLite when no storage/url/env is configured.
         self._cache = DataCache(
             cache_dir=cache_dir,
             client=DatabentoClient(api_key=resolved),
             storage=storage,
-            url=resolved_url,
+            url=url,
         )
         self.timeseries = _CachedTimeseries(self._cache, lambda: self._real)
 

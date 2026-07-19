@@ -40,9 +40,10 @@ Default cache locations:
 - **Unix/Mac:** `~/.databento`
 - **Windows:** `%LOCALAPPDATA%\databento`
 
-The `Historical` drop-in caches to SQLite (`<cache_dir>/cache.db`) by default.
-Point the cache at a different database — or force a specific backend — with a
-connection URL (see [SQL cache backend](#sql-cache-backend-centralized-cache)):
+dbn-cache caches to SQLite (`<cache_dir>/cache.db`) by default — both the
+`Historical` drop-in and `DataCache`. Point the cache at a different database — or
+force a specific backend — with a connection URL (see
+[SQL cache backend](#sql-cache-backend-centralized-cache)):
 
 ```bash
 export DBN_CACHE_URL="postgresql://user:pw@host:5432/marketdata"  # shared DB
@@ -209,7 +210,8 @@ dbn completions powershell >> $PROFILE
 from datetime import date
 from dbn_cache import DataCache, get_contract_dates
 
-# Initialize cache (uses ~/.databento by default)
+# Initialize cache (SQLite at ~/.databento/cache.db by default;
+# pass url=... for Postgres/MySQL, or url="file:///path" for Parquet on disk)
 cache = DataCache()
 
 # Download and cache data
@@ -322,9 +324,8 @@ db.Historical("YOUR_KEY", url="file:///path/to/dir")                     # Parqu
 
 ## SQL cache backend (centralized cache)
 
-The `Historical` drop-in caches to SQLite by default; the SQL backend also works
-with `DataCache` (which itself still defaults to Parquet-on-disk). SQLite needs no
-extra install; add a driver for a remote database:
+Both `DataCache` and the `Historical` drop-in cache to SQLite by default. SQLite
+needs no extra install; add a driver for a remote database:
 
 ```bash
 pip install 'dbn-cache[postgres]'   # + PostgreSQL driver

@@ -16,7 +16,7 @@ class TestDataCacheInit:
         assert cache.cache_dir == Path.home() / ".databento"
 
     def test_custom_cache_dir(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
         assert cache.cache_dir == tmp_path
 
     def test_env_cache_dir(
@@ -26,15 +26,35 @@ class TestDataCacheInit:
         cache = DataCache()
         assert cache.cache_dir == tmp_path
 
+    def test_defaults_to_sqlite_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dbn_cache.storage.sql import SqlBackend
+
+        monkeypatch.delenv("DBN_CACHE_URL", raising=False)
+        monkeypatch.delenv("DATABENTO_CACHE_URL", raising=False)
+        cache = DataCache(cache_dir=tmp_path)
+        assert isinstance(cache.backend, SqlBackend)
+        # Lazy: no database file until the cache is actually used.
+        assert not (tmp_path / "cache.db").exists()
+        cache.list_cached()
+        assert (tmp_path / "cache.db").exists()
+
+    def test_file_url_selects_filesystem(self, tmp_path: Path) -> None:
+        from dbn_cache.storage.filesystem import FilesystemBackend
+
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
+        assert isinstance(cache.backend, FilesystemBackend)
+
 
 class TestDataCacheGet:
     def test_get_not_cached(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
         with pytest.raises(CacheMissError):
             cache.get("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 3, 31))
 
     def test_get_partial_cache(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -58,7 +78,7 @@ class TestDataCacheGet:
             cache.get("ES.c.0", "ohlcv-1m", date(2024, 1, 1), date(2024, 3, 31))
 
     def test_get_cached(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -84,12 +104,12 @@ class TestDataCacheGet:
 
 class TestDataCacheInfo:
     def test_info_not_cached(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
         info = cache.info("ES.c.0", "ohlcv-1m")
         assert info is None
 
     def test_info_cached(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -117,12 +137,12 @@ class TestDataCacheInfo:
 
 class TestDataCacheListCached:
     def test_list_empty(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
         items = cache.list_cached()
         assert items == []
 
     def test_list_with_data(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -146,12 +166,12 @@ class TestDataCacheListCached:
 
 class TestDataCacheUpdate:
     def test_update_no_cached_data(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
         with pytest.raises(CacheMissError, match="No cached data"):
             cache.update("ES.c.0", "ohlcv-1m")
 
     def test_update_already_up_to_date(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -176,7 +196,7 @@ class TestDataCacheUpdate:
 
     def test_update_expired_futures_contract(self, tmp_path: Path) -> None:
         """Expired futures contracts should not be updated past expiration."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         # NQH24 expired on 2024-03-15 (3rd Friday of March 2024)
         base_path = tmp_path / "GLBX.MDP3" / "NQH24" / "ohlcv-1d"
@@ -208,7 +228,7 @@ class TestClearCacheMetadata:
 
     def test_clear_middle_splits_range(self, tmp_path: Path) -> None:
         """Clearing a subrange should split metadata into two non-overlapping ranges."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -240,7 +260,7 @@ class TestClearCacheMetadata:
 
     def test_clear_start_trims_range(self, tmp_path: Path) -> None:
         """Clearing from the start should trim the beginning of the range."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -277,7 +297,7 @@ class TestGetUpdateRangeExpiredContracts:
         """Fully cached expired contracts should not need updates."""
         from dbn_cache.models import CachedDataInfo
 
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         # NQH24 expired on 2024-03-15
         cached_info = CachedDataInfo(
@@ -295,7 +315,7 @@ class TestGetUpdateRangeExpiredContracts:
         """Contracts cached before expiration should cap update at expiration."""
         from dbn_cache.models import CachedDataInfo
 
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         # NQH24 expired on 2024-03-15, but only cached through March 10
         cached_info = CachedDataInfo(
@@ -316,7 +336,7 @@ class TestGetUpdateRangeExpiredContracts:
         """Continuous futures contracts should not have expiration caps."""
         from dbn_cache.models import CachedDataInfo
 
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         cached_info = CachedDataInfo(
             dataset="GLBX.MDP3",
@@ -347,7 +367,7 @@ class TestGetUpdateRangeAvailableEnd:
             "start": "2010-06-06T00:00:00.000000000Z",
             "end": "2026-01-31T00:00:00.000000000Z",
         }
-        cache = DataCache(cache_dir=tmp_path, client=client)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}", client=client)
 
         cached_info = CachedDataInfo(
             dataset="GLBX.MDP3",
@@ -374,7 +394,7 @@ class TestGetUpdateRangeAvailableEnd:
         client.get_dataset_range.return_value = {
             "end": "2026-01-31T00:00:00.000000000Z",
         }
-        cache = DataCache(cache_dir=tmp_path, client=client)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}", client=client)
 
         cached_info = CachedDataInfo(
             dataset="GLBX.MDP3",
@@ -397,7 +417,7 @@ class TestGetUpdateRangeAvailableEnd:
         client.get_dataset_range.return_value = {
             "end": "2026-01-31T00:00:00.000000000Z",
         }
-        cache = DataCache(cache_dir=tmp_path, client=client)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}", client=client)
 
         info1 = CachedDataInfo(
             dataset="GLBX.MDP3",
@@ -422,7 +442,7 @@ class TestGetUpdateRangeAvailableEnd:
         """Should fall back to yesterday when API is unavailable."""
         from dbn_cache.models import CachedDataInfo
 
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         cached_info = CachedDataInfo(
             dataset="GLBX.MDP3",
@@ -443,14 +463,14 @@ class TestGetUpdateRangeAvailableEnd:
 
 class TestDataCacheUpdateAll:
     def test_update_all_empty_cache(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
         result = cache.update_all()
         assert result.updated_count == 0
         assert result.up_to_date_count == 0
         assert result.error_count == 0
 
     def test_update_all_already_up_to_date(self, tmp_path: Path) -> None:
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -482,7 +502,7 @@ class TestValidateMetadata:
 
     def test_fragmented_ranges_detected(self, tmp_path: Path) -> None:
         """Fragmented ranges should be detected by validate_metadata."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -541,7 +561,7 @@ class TestValidateMetadata:
 
     def test_single_range_not_modified(self, tmp_path: Path) -> None:
         """A single valid range should not be modified."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -583,7 +603,7 @@ class TestRepairOrphanedMetadata:
 
     def test_repair_orphaned_parquet(self, tmp_path: Path) -> None:
         """Parquet files without meta.json should have metadata rebuilt."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -620,7 +640,7 @@ class TestRepairOrphanedMetadata:
 
     def test_repair_no_orphans(self, tmp_path: Path) -> None:
         """When all metadata exists, repair returns empty list."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -647,7 +667,7 @@ class TestRepairOrphanedMetadata:
 
     def test_repair_empty_directory(self, tmp_path: Path) -> None:
         """Directory with no parquet files should not be repaired."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -663,7 +683,7 @@ class TestOHLCVPartitionDateExpansion:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Mid-month update should download from start of cached data."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "ohlcv-1m"
         base_path.mkdir(parents=True)
@@ -732,7 +752,7 @@ class TestOHLCVPartitionDateExpansion:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Tick schemas (daily partitions) should not expand to include cached."""
-        cache = DataCache(cache_dir=tmp_path)
+        cache = DataCache(cache_dir=tmp_path, url=f"file://{tmp_path}")
 
         base_path = tmp_path / "GLBX.MDP3" / "ES_c_0" / "trades"
         base_path.mkdir(parents=True)
