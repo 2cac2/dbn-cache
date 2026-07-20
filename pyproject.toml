@@ -1,6 +1,6 @@
 [project]
 name = "dbn-cache"
-version = "1.3.1"
+version = "2.0.0"
 description = "Download and cache historical market data from Databento"
 readme = "README.md"
 license = "MIT"
@@ -22,16 +22,17 @@ dependencies = [
     "polars>=1.0",
     "pandas>=2.0,<3",
     "pyarrow>=18.0",
-    "click>=8.0",
     "pydantic>=2.0",
     "filelock>=3.0",
-    "rich>=13.0",
     "exchange-calendars>=4.12",
+    # SQL cache backend. Caches to SQLite by default; SQLite needs no extra driver.
+    "sqlmodel>=0.0.14",
 ]
 
-[project.scripts]
-dbn = "dbn_cache.cli:main"
-dbn-cache = "dbn_cache.cli:main"
+[project.optional-dependencies]
+# Drivers for using a remote SQL database as the centralized cache.
+postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.1"]
 
 [project.urls]
 Homepage = "https://github.com/azizuysal/dbn-cache"
@@ -39,7 +40,13 @@ Repository = "https://github.com/azizuysal/dbn-cache"
 Issues = "https://github.com/azizuysal/dbn-cache/issues"
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-cov>=6.0", "ruff>=0.8", "pyright>=1.1.408", "pandas-stubs>=2.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "pyright>=1.1.408",
+    "pandas-stubs>=2.0",
+]
 
 [build-system]
 requires = ["hatchling"]

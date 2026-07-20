@@ -1,11 +1,15 @@
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import Enum, auto
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pandas as pd
 import polars as pl
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from .storage.base import DataReader
 
 
 class DownloadStatus(Enum):
@@ -144,63 +148,85 @@ class UpdateAllResult:
 
 
 class CachedData:
-    """Wrapper for cached parquet files with multi-library access."""
+    """Wrapper for cached data with multi-library access.
+
+    Accepts either a list of parquet file paths (filesystem cache) or a
+    :class:`~dbn_cache.storage.base.DataReader` (e.g. a SQL-backed cache). Both
+    are read lazily and trimmed to the requested inclusive date range.
+    """
 
     def __init__(
         self,
-        paths: list[Path],
+        source: "list[Path] | DataReader",
         start: date | None = None,
         end: date | None = None,
     ) -> None:
-        self._paths = sorted(paths)
+        if isinstance(source, list):
+            self._reader: DataReader | None = None
+            self._paths: list[Path] = sorted(source)
+        else:
+            self._reader = source
+            self._paths = sorted(source.paths)
         self._start = start
         self._end = end
 
     @property
     def paths(self) -> list[Path]:
-        """Get paths to cached parquet files."""
+        """Get backing parquet file paths (empty for non-file backends)."""
         return self._paths
 
+    def _scan(self) -> pl.LazyFrame:
+        """Scan the underlying source into a LazyFrame (unfiltered)."""
+        if self._reader is not None:
+            return self._reader.scan()
+        if not self._paths:
+            return pl.LazyFrame()
+        return pl.scan_parquet(self._paths)
+
     def _apply_date_filter(self, lf: pl.LazyFrame) -> pl.LazyFrame:
-        """Apply date range filter to LazyFrame using ts_event column."""
+        """Apply the inclusive date range filter using the ts_event column.
+
+        Handles both integer-nanosecond (Databento raw) and Datetime ts_event
+        columns; Datetime columns are compared via their UNIX-epoch nanoseconds.
+        """
         if self._start is None and self._end is None:
             return lf
 
-        # Check if ts_event column exists
         schema = lf.collect_schema()
         if "ts_event" not in schema:
             return lf
 
-        # ts_event is in nanoseconds since UNIX epoch
-        # Convert dates to nanosecond timestamps
+        dtype = schema["ts_event"]
+        is_datetime = dtype == pl.Datetime or str(dtype).startswith("Datetime")
+        ts_ns = pl.col("ts_event").dt.epoch("ns") if is_datetime else pl.col("ts_event")
+
+        # ts_event is compared in UTC epoch nanoseconds, so build the day bounds
+        # in UTC too (not the machine's local timezone).
         # end date is inclusive, so we need to include the entire day
         if self._start is not None:
             start_ns = int(
-                datetime.combine(self._start, datetime.min.time()).timestamp() * 1e9
+                datetime.combine(
+                    self._start, datetime.min.time(), tzinfo=UTC
+                ).timestamp()
+                * 1e9
             )
-            lf = lf.filter(pl.col("ts_event") >= start_ns)
+            lf = lf.filter(ts_ns >= start_ns)
 
         if self._end is not None:
             # End of day (23:59:59.999999999) for inclusive end date
-            end_dt = datetime.combine(self._end, datetime.min.time())
+            end_dt = datetime.combine(self._end, datetime.min.time(), tzinfo=UTC)
             end_ns = int((end_dt.timestamp() + 86400) * 1e9) - 1
-            lf = lf.filter(pl.col("ts_event") <= end_ns)
+            lf = lf.filter(ts_ns <= end_ns)
 
         return lf
 
     def to_polars(self) -> pl.LazyFrame:
         """Load data as Polars LazyFrame, filtered to requested date range."""
-        if not self._paths:
-            return pl.LazyFrame()
-        lf = pl.scan_parquet(self._paths)
-        return self._apply_date_filter(lf)
+        return self._apply_date_filter(self._scan())
 
     def to_pandas(self) -> pd.DataFrame:
         """Load data as Pandas DataFrame, filtered to requested date range."""
-        if not self._paths:
-            return pd.DataFrame()
-        lf = self.to_polars()
-        return lf.collect().to_pandas()
+        return self.to_polars().collect().to_pandas()
 
     def __repr__(self) -> str:
         return f"CachedData(paths={len(self._paths)} files)"

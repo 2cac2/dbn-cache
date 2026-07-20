@@ -12,16 +12,6 @@ uv add dbn-cache
 pip install dbn-cache
 ```
 
-### CLI only (global install)
-
-```bash
-uv tool install dbn-cache
-# or
-pipx install dbn-cache
-# or
-mise use -g pipx:dbn-cache
-```
-
 ## Configuration
 
 Set your Databento API key:
@@ -40,159 +30,15 @@ Default cache locations:
 - **Unix/Mac:** `~/.databento`
 - **Windows:** `%LOCALAPPDATA%\databento`
 
-## CLI Usage
-
-The CLI is available as `dbn` (or `dbn-cache`):
-
-```bash
-# Show help
-dbn -h
-dbn download -h
-
-# Download E-mini S&P 500 continuous futures (1-minute OHLCV)
-dbn download ES.c.0 --schema ohlcv-1m --start 2024-01-01 --end 2024-12-01
-
-# Download specific contract (dates auto-detected for supported futures)
-dbn download NQH25 --schema ohlcv-1m
-
-# Download current front-month contract (auto-detected)
-dbn download NQ --schema ohlcv-1m
-dbn download MNQ --schema ohlcv-1m
-
-# Batch download all quarterly contracts for a root symbol
-dbn download NQ --schema ohlcv-1m --from 2016              # 2016 to present
-dbn download NQ --schema ohlcv-1m --from 2016 --to 2020    # 2016 to 2020
-
-# Override auto-detection with explicit dates
-dbn download ESZ24 --schema trades --start 2024-11-01 --end 2024-12-01
-
-# Download from different dataset (default: GLBX.MDP3)
-dbn download AAPL --schema trades --start 2024-01-01 --end 2024-01-31 -d XNAS.ITCH
-
-# Update cached data to latest available (data has ~24h embargo)
-dbn update ES.c.0                # Update all schemas for symbol
-dbn update ES.c.0 -s ohlcv-1m    # Update specific schema
-dbn update mnq                   # Update + auto-roll expired contracts
-dbn update --all                  # Update everything in cache
-dbn update --all --no-roll        # Update without auto-rolling
-
-# List cached data (table view with quality indicators)
-dbn list                    # All cached data
-dbn list NQ                 # Filter by symbol prefix
-dbn list -s ohlcv-1m        # Filter by schema
-dbn list -v                 # Verbose output with quality details
-dbn list -v ES.c.0          # Verbose for specific symbol
-
-# Estimate cost before downloading
-dbn cost ES.c.0 --schema trades --start 2024-01-01 --end 2024-12-01
-
-# Verify cache integrity (check for missing files)
-dbn verify
-dbn verify --fix  # Rebuild missing metadata and remove stale entries
-
-# Reference commands
-dbn datasets  # List available datasets
-dbn schemas   # List available schemas
-dbn symbols   # Show symbol format examples
-```
-
-### Auto-Detection for Futures Contracts
-
-For supported futures contracts, dates are automatically calculated based on contract specifications:
+dbn-cache caches to SQLite (`<cache_dir>/cache.db`) by default — both the
+`Historical` drop-in and `DataCache`. Point the cache at a different database — or
+force a specific backend — with a connection URL (see
+[SQL cache backend](#sql-cache-backend-centralized-cache)):
 
 ```bash
-# No --start/--end needed - dates auto-detected
-dbn download NQH25 --schema ohlcv-1m
-# → Downloads: Dec 6, 2024 to Mar 21, 2025
-
-# Adjust rollover buffer (default 14 days before front-month)
-dbn download NQH25 --schema ohlcv-1m --rollover-days 7
-
-# Explicit dates still work and override auto-detection
-dbn download NQH25 --schema ohlcv-1m --start 2024-12-01 --end 2025-03-21
+export DBN_CACHE_URL="postgresql://user:pw@host:5432/marketdata"  # shared DB
+# export DBN_CACHE_URL="file:///path/to/dir"                      # Parquet on disk
 ```
-
-### Front-Month Download
-
-When given a bare root symbol (no `--from`, no `--start/--end`), the CLI automatically resolves it to the current front-month contract:
-
-```bash
-dbn download NQ --schema ohlcv-1m
-# → Resolves to NQM26 (or whichever contract is currently active)
-# → Dates auto-detected from rollover through expiration
-
-dbn download MNQ --schema ohlcv-1m
-# → Resolves to MNQM26
-```
-
-### Auto-Roll on Update
-
-When updating cached data, expired futures contracts automatically trigger download of the successor contract with the same schemas:
-
-```bash
-# MNQH26 expired → automatically downloads MNQM26 with same schemas
-dbn update mnq
-
-# Disable auto-roll
-dbn update mnq --no-roll
-```
-
-### Batch Download
-
-Download all quarterly contracts for a root symbol over a year range:
-
-```bash
-# Download NQ contracts from 2016 to present
-dbn download NQ --schema ohlcv-1m --from 2016
-
-# Download NQ contracts from 2016 to 2020
-dbn download NQ --schema ohlcv-1m --from 2016 --to 2020
-# → Downloads: NQH16, NQM16, NQU16, NQZ16, NQH17, ..., NQZ20 (20 contracts)
-```
-
-This downloads all quarterly contracts (March, June, September, December) for the specified years. Each contract's dates are auto-detected. Already-cached contracts are skipped.
-
-**Symbol format:** `ROOT` + `MONTH_CODE` + `2-DIGIT_YEAR`
-
-| Input | Interpreted As |
-|-------|---------------|
-| `NQH25` | March 2025 |
-| `NQH16` | March 2016 |
-| `ESZ24` | December 2024 |
-
-Always use 2-digit years (e.g., `NQH25`, not `NQH5`).
-
-**Supported products:**
-- **Equity index:** ES, NQ, RTY, YM, EMD, MES, MNQ, M2K, MYM, NKD, NIY
-- **Treasuries:** ZB, ZN, ZF, ZT, UB
-- **Metals:** GC, SI, HG, PL, PA
-
-**Date calculation:**
-- **End:** Contract expiration date
-- **Start:** Previous quarterly contract expiration minus rollover buffer
-
-For other symbols (stocks, continuous futures, unsupported products), `--start` and `--end` are required.
-
-### Shell Completions
-
-```bash
-# Zsh (add to .zshrc)
-eval "$(dbn completions zsh)"
-
-# Bash (add to .bashrc)
-eval "$(dbn completions bash)"
-
-# Fish
-dbn completions fish > ~/.config/fish/completions/dbn.fish
-
-# PowerShell (Windows)
-dbn completions powershell >> $PROFILE
-```
-
-## Cancellation & Error Handling
-
-- Press `Ctrl+C` to cancel gracefully; partial downloads are saved and can be resumed
-- All errors are caught and displayed with clear messages (no unhandled exceptions)
 
 ## Library Usage
 
@@ -200,7 +46,8 @@ dbn completions powershell >> $PROFILE
 from datetime import date
 from dbn_cache import DataCache, get_contract_dates
 
-# Initialize cache (uses ~/.databento by default)
+# Initialize cache (SQLite at ~/.databento/cache.db by default;
+# pass url=... for Postgres/MySQL, or url="file:///path" for Parquet on disk)
 cache = DataCache()
 
 # Download and cache data
@@ -268,6 +115,81 @@ from pathlib import Path
 cache = DataCache(cache_dir=Path("/path/to/cache"))
 ```
 
+## Databento drop-in (1:1 API)
+
+`dbn_cache.Historical` mirrors `databento.Historical`, so existing Databento code
+works unchanged — just swap the import — and `timeseries.get_range` results are
+cached transparently (like `yfinance-cache` wraps `yfinance`):
+
+```python
+import dbn_cache as db  # instead of: import databento as db
+
+client = db.Historical("YOUR_KEY")  # or set DATABENTO_API_KEY
+
+data = client.timeseries.get_range(
+    dataset="GLBX.MDP3",
+    symbols="ES.c.0",
+    schema="ohlcv-1m",
+    start="2024-01-01",
+    end="2024-02-01",  # end is exclusive, matching databento
+)
+
+df = data.to_df()          # pandas (served from cache on repeat calls)
+pl_df = data.to_polars()   # polars (dbn-cache extension)
+data.to_parquet("es.parquet")
+```
+
+The drop-in **caches to SQLite by default** — no configuration needed. With no
+`url`/`storage`, it uses `<cache_dir>/cache.db` (`cache_dir` defaults to
+`~/.databento` or `DATABENTO_CACHE_DIR`). Point it at a shared database for a
+centralized cache, or opt into Parquet-on-disk:
+
+```python
+db.Historical("YOUR_KEY")                                                # SQLite (default)
+db.Historical("YOUR_KEY", url="postgresql://user:pw@host:5432/market")   # shared Postgres
+db.Historical("YOUR_KEY", url="file:///path/to/dir")                     # Parquet on disk
+```
+
+- `metadata`, `symbology`, and `batch` pass through to a real `databento.Historical`.
+- Only `timeseries.get_range` is cached. Requests for `ALL_SYMBOLS` or instrument-id
+  symbols bypass the cache and return a genuine `DBNStore`.
+- The result is a `CacheStore` supporting `.to_df()`, `.to_ndarray()`,
+  `.to_parquet()`, `.to_csv()`, `.to_json()`, and iteration. Operations that need
+  the raw DBN binary (`to_file`, `replay`, `request_symbology`, …) raise
+  `NotImplementedError` — use `databento.Historical` directly for those.
+
+## SQL cache backend (centralized cache)
+
+Both `DataCache` and the `Historical` drop-in cache to SQLite by default. SQLite
+needs no extra install; add a driver for a remote database:
+
+```bash
+pip install 'dbn-cache[postgres]'   # + PostgreSQL driver
+pip install 'dbn-cache[mysql]'      # + MySQL driver
+```
+
+Select the backend with a connection URL (in code, or via the `DBN_CACHE_URL`
+environment variable):
+
+```python
+import dbn_cache as db
+
+# Local SQLite file (also the Historical default)
+cache = db.DataCache(url="sqlite:///market-data.db")
+
+# Shared PostgreSQL (centralized cache)
+client = db.Historical("YOUR_KEY", url="postgresql://user:pw@host:5432/marketdata")
+```
+
+Data is stored as columnar rows (one table per schema, e.g. `data_ohlcv_1m`) plus a
+`cache_partitions` registry, so the database is directly queryable as market data.
+SQLite is single-writer (ideal for one machine); use PostgreSQL/MySQL for concurrent
+shared access.
+
+> **Note:** SQL `TIMESTAMP` types are microsecond-precision, so SQL backends do not
+> preserve sub-microsecond `ts_event` detail. For nanosecond-precise tick data, use
+> the filesystem (Parquet) backend (`url="file:///path"`).
+
 ## Supported Symbols
 
 ### Stocks
@@ -287,7 +209,8 @@ Common products: `ES` (S&P 500), `NQ` (Nasdaq), `CL` (Crude Oil), `GC` (Gold), `
 
 ## Schemas
 
-Run `dbn schemas` for the full list. Common schemas:
+See the [Databento schema reference](https://databento.com/docs/schemas-and-data-formats)
+for the full list. Common schemas:
 
 | Schema | Description | Partition |
 |--------|-------------|-----------|
@@ -301,8 +224,15 @@ Run `dbn schemas` for the full list. Common schemas:
 
 ## Cache Structure
 
+By default the cache is a single SQLite database (`<cache_dir>/cache.db`) with one
+table per schema (e.g. `data_ohlcv_1m`) plus a `cache_partitions` registry, so it's
+directly queryable as market data. A PostgreSQL/MySQL URL uses the same layout.
+
+The filesystem backend (`url="file:///path"`) instead stores partitioned Parquet
+files with JSON metadata sidecars:
+
 ```
-~/.databento/
+<cache_dir>/
 └── GLBX.MDP3/
     └── ES_c_0/
         └── ohlcv-1m/
